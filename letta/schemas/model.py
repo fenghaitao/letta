@@ -42,11 +42,17 @@ class Model(LLMConfig, ModelBase):
         "koboldcpp",
         "vllm",
         "hugging-face",
+        "baseten",
+        "minimax",
         "mistral",
         "together",
         "bedrock",
         "deepseek",
         "xai",
+        "zai",
+        "zai_coding",
+        "openrouter",
+        "chatgpt_oauth",
     ] = Field(..., description="Deprecated: Use 'provider_type' field instead. The endpoint type for the model.", deprecated=True)
     context_window: int = Field(
         ..., description="Deprecated: Use 'max_context_window' field instead. The context window size for the model.", deprecated=True
@@ -65,7 +71,7 @@ class Model(LLMConfig, ModelBase):
         description="Deprecated: Whether or not the model should use extended thinking if it is a 'reasoning' style model.",
         deprecated=True,
     )
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = Field(
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = Field(
         None, description="Deprecated: The reasoning effort to use when generating text reasoning models.", deprecated=True
     )
     max_reasoning_tokens: int = Field(0, description="Deprecated: Configurable thinking budget for extended thinking.", deprecated=True)
@@ -126,15 +132,19 @@ class Model(LLMConfig, ModelBase):
         """Returns the JSON schema for the ModelSettings class corresponding to this model's provider."""
         PROVIDER_SETTINGS_MAP = {
             ProviderType.openai: OpenAIModelSettings,
+            ProviderType.sglang: SGLangModelSettings,
             ProviderType.anthropic: AnthropicModelSettings,
             ProviderType.google_ai: GoogleAIModelSettings,
             ProviderType.google_vertex: GoogleVertexModelSettings,
             ProviderType.azure: AzureModelSettings,
             ProviderType.xai: XAIModelSettings,
+            ProviderType.zai: ZAIModelSettings,
+            ProviderType.zai_coding: ZAIModelSettings,
             ProviderType.groq: GroqModelSettings,
             ProviderType.deepseek: DeepseekModelSettings,
             ProviderType.together: TogetherModelSettings,
             ProviderType.bedrock: BedrockModelSettings,
+            ProviderType.openrouter: OpenRouterModelSettings,
         }
 
         settings_class = PROVIDER_SETTINGS_MAP.get(self.provider_type)
@@ -206,11 +216,11 @@ class ModelSettings(BaseModel):
 
     # model: str = Field(..., description="The name of the model.")
     max_output_tokens: int = Field(4096, description="The maximum number of tokens the model can generate.")
-    parallel_tool_calls: bool = Field(False, description="Whether to enable parallel tool calling.")
+    parallel_tool_calls: bool = Field(True, description="Whether to enable parallel tool calling.")
 
 
 class OpenAIReasoning(BaseModel):
-    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] = Field(
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] = Field(
         "minimal", description="The reasoning effort to use when generating text reasoning models"
     )
 
@@ -225,6 +235,11 @@ class OpenAIModelSettings(ModelSettings):
     temperature: float = Field(0.7, description="The temperature of the model.")
     reasoning: OpenAIReasoning = Field(OpenAIReasoning(reasoning_effort="high"), description="The reasoning configuration for the model.")
     response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the model.")
+    # OpenAI supports strict mode for tool calling - defaults to True
+    strict: bool = Field(
+        True,
+        description="Enable strict mode for tool calling. When true, tool outputs are guaranteed to match JSON schemas.",
+    )
 
     # TODO: implement support for these
     # reasoning_summary: Optional[Literal["none", "short", "detailed"]] = Field(
@@ -242,7 +257,23 @@ class OpenAIModelSettings(ModelSettings):
             "reasoning_effort": self.reasoning.reasoning_effort,
             "response_format": self.response_format,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": self.strict,
         }
+
+
+class SGLangModelSettings(OpenAIModelSettings):
+    """SGLang model configuration (OpenAI-compatible runtime with SGLang-specific parsing)."""
+
+    provider_type: Literal[ProviderType.sglang] = Field(ProviderType.sglang, description="The type of the provider.")
+    tool_call_parser: Optional[str] = Field(
+        None,
+        description="SGLang tool call parser name (for example 'glm47', 'qwen25', or 'hermes').",
+    )
+
+    def _to_legacy_config_params(self) -> dict:
+        params = super()._to_legacy_config_params()
+        params["tool_call_parser"] = self.tool_call_parser
+        return params
 
 
 #    "thinking": {
@@ -262,6 +293,7 @@ class AnthropicModelSettings(ModelSettings):
     thinking: AnthropicThinking = Field(
         AnthropicThinking(type="enabled", budget_tokens=1024), description="The thinking configuration for the model."
     )
+    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the model.")
 
     # gpt-5 models only
     verbosity: Optional[Literal["low", "medium", "high"]] = Field(
@@ -269,10 +301,16 @@ class AnthropicModelSettings(ModelSettings):
         description="Soft control for how verbose model output should be, used for GPT-5 models.",
     )
 
-    # Opus 4.5 effort parameter
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    # Effort parameter for Opus 4.5, Opus 4.6, and Sonnet 4.6
+    effort: Optional[Literal["low", "medium", "high", "max"]] = Field(
         None,
-        description="Effort level for Opus 4.5 model (controls token conservation). Not setting this gives similar performance to 'high'.",
+        description="Effort level for supported Anthropic models (controls token spending). 'max' is only available on Opus 4.6. Not setting this gives similar performance to 'high'.",
+    )
+
+    # Anthropic supports strict mode for tool calling - defaults to False
+    strict: bool = Field(
+        False,
+        description="Enable strict mode for tool calling. When true, tool outputs are guaranteed to match JSON schemas.",
     )
 
     # TODO: implement support for these
@@ -284,10 +322,12 @@ class AnthropicModelSettings(ModelSettings):
             "temperature": self.temperature,
             "max_tokens": self.max_output_tokens,
             "extended_thinking": self.thinking.type == "enabled",
-            "thinking_budget_tokens": self.thinking.budget_tokens,
+            "max_reasoning_tokens": self.thinking.budget_tokens,
             "verbosity": self.verbosity,
             "parallel_tool_calls": self.parallel_tool_calls,
             "effort": self.effort,
+            "response_format": self.response_format,
+            "strict": self.strict,
         }
 
 
@@ -311,6 +351,7 @@ class GoogleAIModelSettings(ModelSettings):
             "max_tokens": self.max_output_tokens,
             "max_reasoning_tokens": self.thinking_config.thinking_budget if self.thinking_config.include_thoughts else 0,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # Google AI does not support strict mode
         }
 
 
@@ -331,6 +372,7 @@ class AzureModelSettings(ModelSettings):
             "max_tokens": self.max_output_tokens,
             "response_format": self.response_format,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # Azure does not support strict mode
         }
 
 
@@ -347,6 +389,35 @@ class XAIModelSettings(ModelSettings):
             "max_tokens": self.max_output_tokens,
             "response_format": self.response_format,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # xAI does not support strict mode
+        }
+
+
+class ZAIThinking(BaseModel):
+    """Thinking configuration for ZAI GLM-4.5+ models."""
+
+    type: Literal["enabled", "disabled"] = Field("enabled", description="Whether thinking is enabled or disabled.")
+    clear_thinking: bool = Field(False, description="If False, preserved thinking is used (recommended for agents).")
+
+
+class ZAIModelSettings(ModelSettings):
+    """Z.ai (ZhipuAI) model configuration (OpenAI-compatible)."""
+
+    provider_type: Literal[ProviderType.zai] = Field(ProviderType.zai, description="The type of the provider.")
+    temperature: float = Field(0.7, description="The temperature of the model.")
+    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the model.")
+    thinking: ZAIThinking = Field(
+        ZAIThinking(type="enabled", clear_thinking=False), description="The thinking configuration for GLM-4.5+ models."
+    )
+
+    def _to_legacy_config_params(self) -> dict:
+        return {
+            "temperature": self.temperature,
+            "max_tokens": self.max_output_tokens,
+            "response_format": self.response_format,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # ZAI does not support strict mode
+            "extended_thinking": self.thinking.type == "enabled",
         }
 
 
@@ -363,6 +434,7 @@ class GroqModelSettings(ModelSettings):
             "max_tokens": self.max_output_tokens,
             "response_format": self.response_format,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # Groq does not support strict mode
         }
 
 
@@ -379,6 +451,7 @@ class DeepseekModelSettings(ModelSettings):
             "max_tokens": self.max_output_tokens,
             "response_format": self.response_format,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # Deepseek does not support strict mode
         }
 
 
@@ -395,6 +468,7 @@ class TogetherModelSettings(ModelSettings):
             "max_tokens": self.max_output_tokens,
             "response_format": self.response_format,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # Together does not support strict mode
         }
 
 
@@ -411,21 +485,85 @@ class BedrockModelSettings(ModelSettings):
             "max_tokens": self.max_output_tokens,
             "response_format": self.response_format,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # Bedrock does not support strict mode
+        }
+
+
+class OpenRouterModelSettings(ModelSettings):
+    """OpenRouter model configuration (OpenAI-compatible)."""
+
+    provider_type: Literal[ProviderType.openrouter] = Field(ProviderType.openrouter, description="The type of the provider.")
+    temperature: float = Field(0.7, description="The temperature of the model.")
+    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the model.")
+
+    def _to_legacy_config_params(self) -> dict:
+        return {
+            "temperature": self.temperature,
+            "max_tokens": self.max_output_tokens,
+            "response_format": self.response_format,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": False,  # OpenRouter does not support strict mode
+        }
+
+
+class ChatGPTOAuthReasoning(BaseModel):
+    """Reasoning configuration for ChatGPT OAuth models (GPT-5.x, o-series)."""
+
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] = Field(
+        "medium", description="The reasoning effort level for GPT-5.x and o-series models."
+    )
+
+
+class ChatGPTOAuthModelSettings(ModelSettings):
+    """ChatGPT OAuth model configuration (uses ChatGPT backend API)."""
+
+    provider_type: Literal[ProviderType.chatgpt_oauth] = Field(ProviderType.chatgpt_oauth, description="The type of the provider.")
+    temperature: float = Field(0.7, description="The temperature of the model.")
+    reasoning: ChatGPTOAuthReasoning = Field(
+        ChatGPTOAuthReasoning(reasoning_effort="medium"), description="The reasoning configuration for the model."
+    )
+
+    def _to_legacy_config_params(self) -> dict:
+        return {
+            "temperature": self.temperature,
+            "max_tokens": self.max_output_tokens,
+            "reasoning_effort": self.reasoning.reasoning_effort,
+            "parallel_tool_calls": self.parallel_tool_calls,
+        }
+
+
+class BasetenModelSettings(ModelSettings):
+    """Baseten model configuration (OpenAI-compatible)."""
+
+    provider_type: Literal[ProviderType.baseten] = Field(ProviderType.baseten, description="The type of the provider.")
+    temperature: float = Field(0.7, description="The temperature of the model.")
+
+    def _to_legacy_config_params(self) -> dict:
+        return {
+            "temperature": self.temperature,
+            "max_tokens": self.max_output_tokens,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "strict": True,
         }
 
 
 ModelSettingsUnion = Annotated[
     Union[
         OpenAIModelSettings,
+        SGLangModelSettings,
         AnthropicModelSettings,
         GoogleAIModelSettings,
         GoogleVertexModelSettings,
         AzureModelSettings,
         XAIModelSettings,
+        ZAIModelSettings,
         GroqModelSettings,
         DeepseekModelSettings,
         TogetherModelSettings,
         BedrockModelSettings,
+        BasetenModelSettings,
+        OpenRouterModelSettings,
+        ChatGPTOAuthModelSettings,
     ],
     Field(discriminator="provider_type"),
 ]

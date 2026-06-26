@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 from datetime import datetime, timezone
 from typing import Tuple
 from unittest.mock import AsyncMock, patch
@@ -36,7 +37,7 @@ from tests.utils import create_tool_from_func
 # Model identifiers used in tests
 MODELS = {
     "sonnet": "anthropic/claude-sonnet-4-20250514",
-    "haiku": "anthropic/claude-haiku-4-5-20251001",
+    "haiku": "anthropic/claude-haiku-4-5",
     "opus": "anthropic/claude-opus-4-1-20250805",
 }
 
@@ -121,7 +122,7 @@ async def agents(server, weather_tool):
                 include_base_tools=True,
                 model=model_name,
                 tags=["test_agents"],
-                embedding="letta/letta-free",
+                embedding="openai/text-embedding-3-small",
                 tool_ids=[weather_tool.id],
                 agent_type="memgpt_v2_agent",
             ),
@@ -368,7 +369,7 @@ async def test_rethink_tool_modify_agent_state(disable_e2b_api_key, server, defa
             include_base_tools=True,
             model=MODELS["sonnet"],
             tags=["test_agents"],
-            embedding="letta/letta-free",
+            embedding="openai/text-embedding-3-small",
             tool_ids=[rethink_tool.id],
             memory_blocks=[
                 {
@@ -769,7 +770,7 @@ def _assert_descending_order(messages):
     if len(messages) <= 1:
         return True
 
-    for prev, next in zip(messages[:-1], messages[1:]):
+    for prev, next in itertools.pairwise(messages):
         assert prev.created_at >= next.created_at, (
             f"Order violation: {prev.id} ({prev.created_at}) followed by {next.id} ({next.created_at})"
         )

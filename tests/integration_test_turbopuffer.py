@@ -45,7 +45,7 @@ async def sarah_agent(server, default_user):
     # Cleanup
     try:
         await server.agent_manager.delete_agent_async(agent.id, default_user)
-    except:
+    except Exception:
         pass
 
 
@@ -151,7 +151,7 @@ async def wait_for_embedding(
             if any(msg["id"] == message_id for msg, _, _ in results):
                 return True
 
-        except Exception as e:
+        except Exception:
             # Log but don't fail - Turbopuffer might still be processing
             pass
 
@@ -347,7 +347,7 @@ async def test_turbopuffer_metadata_attributes(default_user, enable_turbopuffer)
         # Clean up on error
         try:
             await client.delete_all_passages(archive_id)
-        except:
+        except Exception:
             pass
         raise e
 
@@ -409,7 +409,7 @@ async def test_hybrid_search_with_real_tpuf(default_user, enable_turbopuffer):
         ]
 
         # Create simple embeddings for testing (normally you'd use a real embedding model)
-        embeddings = [[float(i), float(i + 5), float(i + 10)] for i in range(len(texts))]
+        [[float(i), float(i + 5), float(i + 10)] for i in range(len(texts))]
         passage_ids = [f"passage-{str(uuid.uuid4())}" for _ in texts]
 
         # Insert passages
@@ -487,7 +487,7 @@ async def test_hybrid_search_with_real_tpuf(default_user, enable_turbopuffer):
         # Clean up
         try:
             await client.delete_all_passages(archive_id)
-        except:
+        except Exception:
             pass
 
 
@@ -522,7 +522,7 @@ async def test_tag_filtering_with_real_tpuf(default_user, enable_turbopuffer):
             ["javascript", "react"],
         ]
 
-        embeddings = [[float(i), float(i + 5), float(i + 10)] for i in range(len(texts))]
+        [[float(i), float(i + 5), float(i + 10)] for i in range(len(texts))]
         passage_ids = [f"passage-{str(uuid.uuid4())}" for _ in texts]
 
         # Insert passages with tags
@@ -615,7 +615,7 @@ async def test_tag_filtering_with_real_tpuf(default_user, enable_turbopuffer):
         # Clean up
         try:
             await client.delete_all_passages(archive_id)
-        except:
+        except Exception:
             pass
 
 
@@ -754,7 +754,7 @@ async def test_temporal_filtering_with_real_tpuf(default_user, enable_turbopuffe
         # Clean up
         try:
             await client.delete_all_passages(archive_id)
-        except:
+        except Exception:
             pass
 
 
@@ -865,12 +865,6 @@ def test_message_text_extraction(server, default_user):
         agent_id="test-agent",
     )
     text6 = manager._extract_message_text(msg6)
-    expected_parts = [
-        "User said:",
-        'Tool call: search({\n  "query": "test"\n})',
-        "Tool result: Found 5 results",
-        "I should help the user",
-    ]
     assert (
         text6
         == '{"content": "User said: Tool call: search({\\n  \\"query\\": \\"test\\"\\n}) Tool result: Found 5 results I should help the user"}'
@@ -1112,7 +1106,7 @@ async def test_message_dual_write_with_real_tpuf(enable_message_embedding, defau
         created_ats = [datetime.now(timezone.utc) for _ in message_texts]
 
         # Generate embeddings (dummy for test)
-        embeddings = [[float(i), float(i + 1), float(i + 2)] for i in range(len(message_texts))]
+        [[float(i), float(i + 1), float(i + 2)] for i in range(len(message_texts))]
 
         # Insert messages into Turbopuffer
         success = await client.insert_messages(
@@ -1144,7 +1138,7 @@ async def test_message_dual_write_with_real_tpuf(enable_message_embedding, defau
         # Clean up namespace
         try:
             await client.delete_all_messages(agent_id)
-        except:
+        except Exception:
             pass
 
 
@@ -1205,7 +1199,7 @@ async def test_message_vector_search_with_real_tpuf(enable_message_embedding, de
         # Clean up namespace
         try:
             await client.delete_all_messages(agent_id)
-        except:
+        except Exception:
             pass
 
 
@@ -1268,7 +1262,7 @@ async def test_message_hybrid_search_with_real_tpuf(enable_message_embedding, de
         # Clean up namespace
         try:
             await client.delete_all_messages(agent_id)
-        except:
+        except Exception:
             pass
 
 
@@ -1340,7 +1334,7 @@ async def test_message_role_filtering_with_real_tpuf(enable_message_embedding, d
         # Clean up namespace
         try:
             await client.delete_all_messages(agent_id)
-        except:
+        except Exception:
             pass
 
 
@@ -1357,7 +1351,7 @@ async def test_message_search_fallback_to_sql(server, default_user, sarah_agent)
         settings.embed_all_messages = False
 
         # Create messages
-        messages = await server.message_manager.create_many_messages_async(
+        await server.message_manager.create_many_messages_async(
             pydantic_msgs=[
                 PydanticMessage(
                     role=MessageRole.user,
@@ -1398,7 +1392,7 @@ async def test_message_update_reindexes_in_turbopuffer(server, default_user, sar
     """Test that updating a message properly deletes and re-inserts with new embedding in Turbopuffer"""
     from letta.schemas.message import MessageUpdate
 
-    embedding_config = sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
+    sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
 
     # Create initial message
     messages = await server.message_manager.create_many_messages_async(
@@ -1492,8 +1486,6 @@ async def test_message_deletion_syncs_with_turbopuffer(server, default_user, ena
         ),
         actor=default_user,
     )
-
-    embedding_config = agent_a.embedding_config
 
     try:
         # Create 5 messages for agent A
@@ -1597,7 +1589,7 @@ async def test_turbopuffer_failure_does_not_break_postgres(server, default_user,
 
     from letta.schemas.message import MessageUpdate
 
-    embedding_config = sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
+    sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
 
     # Create initial messages
     messages = await server.message_manager.create_many_messages_async(
@@ -1668,7 +1660,7 @@ async def test_turbopuffer_failure_does_not_break_postgres(server, default_user,
 @pytest.mark.skipif(not settings.tpuf_api_key, reason="Turbopuffer API key not configured")
 async def test_message_creation_background_mode(server, default_user, sarah_agent, enable_message_embedding):
     """Test that messages are embedded in background when strict_mode=False"""
-    embedding_config = sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
+    sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
 
     # Create message in background mode
     messages = await server.message_manager.create_many_messages_async(
@@ -1723,7 +1715,7 @@ async def test_message_update_background_mode(server, default_user, sarah_agent,
     """Test that message updates work in background mode"""
     from letta.schemas.message import MessageUpdate
 
-    embedding_config = sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
+    sarah_agent.embedding_config or EmbeddingConfig.default_config(provider="openai")
 
     # Create initial message with strict_mode=True to ensure it's embedded
     messages = await server.message_manager.create_many_messages_async(
@@ -1899,7 +1891,7 @@ async def test_message_date_filtering_with_real_tpuf(enable_message_embedding, d
         # Clean up namespace
         try:
             await client.delete_all_messages(agent_id)
-        except:
+        except Exception:
             pass
 
 
@@ -2168,9 +2160,331 @@ async def test_message_template_id_filtering(server, sarah_agent, default_user, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not settings.tpuf_api_key, reason="Turbopuffer API key not configured")
+async def test_message_conversation_id_filtering(server, sarah_agent, default_user, enable_turbopuffer, enable_message_embedding):
+    """Test that conversation_id filtering works correctly in message queries, including 'default' sentinel"""
+    from letta.schemas.conversation import CreateConversation
+    from letta.schemas.letta_message_content import TextContent
+    from letta.services.conversation_manager import ConversationManager
+
+    conversation_manager = ConversationManager()
+
+    # Create a conversation
+    conversation = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Test conversation"),
+        actor=default_user,
+    )
+
+    # Create messages with different conversation_ids
+    message_with_conv = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role=MessageRole.user,
+        content=[TextContent(text="Message in specific conversation about Python")],
+    )
+
+    message_default_conv = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role=MessageRole.user,
+        content=[TextContent(text="Message in default conversation about JavaScript")],
+    )
+
+    # Insert messages with their respective conversation IDs
+    tpuf_client = TurbopufferClient()
+
+    # Message with specific conversation_id
+    await tpuf_client.insert_messages(
+        agent_id=sarah_agent.id,
+        message_texts=[message_with_conv.content[0].text],
+        message_ids=[message_with_conv.id],
+        organization_id=default_user.organization_id,
+        actor=default_user,
+        roles=[message_with_conv.role],
+        created_ats=[message_with_conv.created_at],
+        conversation_ids=[conversation.id],  # Specific conversation
+    )
+
+    # Message with no conversation_id (default)
+    await tpuf_client.insert_messages(
+        agent_id=sarah_agent.id,
+        message_texts=[message_default_conv.content[0].text],
+        message_ids=[message_default_conv.id],
+        organization_id=default_user.organization_id,
+        actor=default_user,
+        roles=[message_default_conv.role],
+        created_ats=[message_default_conv.created_at],
+        conversation_ids=[None],  # Default conversation (NULL)
+    )
+
+    # Wait for indexing
+    await asyncio.sleep(1)
+
+    # Test 1: Query for specific conversation - should find only message with that conversation_id
+    results_conv = await tpuf_client.query_messages_by_agent_id(
+        agent_id=sarah_agent.id,
+        organization_id=default_user.organization_id,
+        search_mode="timestamp",
+        top_k=10,
+        conversation_id=conversation.id,
+        actor=default_user,
+    )
+
+    assert len(results_conv) == 1
+    assert results_conv[0][0]["id"] == message_with_conv.id
+    assert "Python" in results_conv[0][0]["text"]
+
+    # Test 2: Query for "default" conversation - should find only messages with NULL conversation_id
+    results_default = await tpuf_client.query_messages_by_agent_id(
+        agent_id=sarah_agent.id,
+        organization_id=default_user.organization_id,
+        search_mode="timestamp",
+        top_k=10,
+        conversation_id="default",  # Sentinel for NULL
+        actor=default_user,
+    )
+
+    assert len(results_default) >= 1  # May have other default messages from setup
+    # Check our message is in there
+    default_ids = [r[0]["id"] for r in results_default]
+    assert message_default_conv.id in default_ids
+
+    # Verify the message content
+    for msg_dict, _, _ in results_default:
+        if msg_dict["id"] == message_default_conv.id:
+            assert "JavaScript" in msg_dict["text"]
+            break
+
+    # Test 3: Query without conversation filter - should find both
+    results_all = await tpuf_client.query_messages_by_agent_id(
+        agent_id=sarah_agent.id,
+        organization_id=default_user.organization_id,
+        search_mode="timestamp",
+        top_k=10,
+        conversation_id=None,  # No filter
+        actor=default_user,
+    )
+
+    assert len(results_all) >= 2  # May have other messages from setup
+    message_ids = [r[0]["id"] for r in results_all]
+    assert message_with_conv.id in message_ids
+    assert message_default_conv.id in message_ids
+
+    # Clean up
+    await tpuf_client.delete_messages(
+        agent_id=sarah_agent.id, organization_id=default_user.organization_id, message_ids=[message_with_conv.id, message_default_conv.id]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not settings.tpuf_api_key, reason="Turbopuffer API key not configured")
+async def test_query_messages_with_mixed_conversation_id_presence(enable_message_embedding, default_user):
+    """Test that querying works when the namespace schema doesn't have conversation_id.
+
+    This test validates the fix for the error:
+    'attribute "conversation_id" not found in schema, cannot be part of include_attributes'
+
+    The fix changed from explicitly listing attributes (which fails when the namespace
+    schema doesn't have conversation_id) to using include_attributes=True which gracefully
+    returns all available attributes.
+
+    IMPORTANT: This test uses raw Turbopuffer API to insert messages WITHOUT
+    the conversation_id schema, then queries BEFORE any new messages are added.
+    This reproduces the exact production scenario where old namespaces don't have
+    conversation_id in their schema.
+    """
+    from turbopuffer import AsyncTurbopuffer
+
+    from letta.helpers.tpuf_client import TurbopufferClient
+
+    client = TurbopufferClient()
+    agent_id = f"test-agent-{uuid.uuid4()}"
+    org_id = str(uuid.uuid4())
+    namespace_name = f"messages_{org_id}_dev"
+
+    try:
+        # Insert messages using raw Turbopuffer API WITHOUT conversation_id in schema
+        # This simulates a namespace that was created before conversation_id feature existed
+        message_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        message_texts = [
+            "Message without conversation_id about Python",
+            "Another message about machine learning",
+        ]
+
+        # Generate embeddings
+        embeddings = await client._generate_embeddings(message_texts, default_user)
+
+        # Use raw Turbopuffer API to insert WITHOUT conversation_id in schema
+        async with AsyncTurbopuffer(api_key=client.api_key, region=client.region) as tpuf:
+            namespace = tpuf.namespace(namespace_name)
+            await namespace.write(
+                upsert_columns={
+                    "id": message_ids,
+                    "vector": embeddings,
+                    "text": message_texts,
+                    "organization_id": [org_id, org_id],
+                    "agent_id": [agent_id, agent_id],
+                    "role": ["user", "assistant"],
+                    "created_at": [datetime.now(timezone.utc), datetime.now(timezone.utc)],
+                    # NOTE: No conversation_id column - schema won't have this attribute!
+                },
+                distance_metric="cosine_distance",
+                schema={
+                    "text": {"type": "string", "full_text_search": True},
+                    # NOTE: No conversation_id in schema - this is the key!
+                },
+            )
+
+        # Wait for indexing
+        await asyncio.sleep(1)
+
+        # CRITICAL: Query BEFORE inserting any new messages with conversation_id
+        # This is when the bug manifests - the schema doesn't have conversation_id yet
+
+        # Test 1: Timestamp mode query
+        timestamp_results = await client.query_messages_by_agent_id(
+            agent_id=agent_id,
+            organization_id=org_id,
+            search_mode="timestamp",
+            top_k=10,
+            actor=default_user,
+        )
+        assert len(timestamp_results) == 2, f"Expected 2 messages, got {len(timestamp_results)}"
+        result_ids = [msg["id"] for msg, _, _ in timestamp_results]
+        for msg_id in message_ids:
+            assert msg_id in result_ids
+
+        # Test 2: Vector search
+        vector_results = await client.query_messages_by_agent_id(
+            agent_id=agent_id,
+            organization_id=org_id,
+            actor=default_user,
+            query_text="Python programming",
+            search_mode="vector",
+            top_k=10,
+        )
+        assert len(vector_results) > 0
+
+        # Test 3: Hybrid search
+        hybrid_results = await client.query_messages_by_agent_id(
+            agent_id=agent_id,
+            organization_id=org_id,
+            actor=default_user,
+            query_text="message",
+            search_mode="hybrid",
+            top_k=10,
+            vector_weight=0.5,
+            fts_weight=0.5,
+        )
+        assert len(hybrid_results) > 0
+
+        # Test 4: FTS search
+        fts_results = await client.query_messages_by_agent_id(
+            agent_id=agent_id,
+            organization_id=org_id,
+            actor=default_user,
+            query_text="Python",
+            search_mode="fts",
+            top_k=10,
+        )
+        assert len(fts_results) > 0
+        assert any("Python" in msg["text"] for msg, _, _ in fts_results)
+
+    finally:
+        # Clean up - delete the entire namespace
+        try:
+            async with AsyncTurbopuffer(api_key=client.api_key, region=client.region) as tpuf:
+                namespace = tpuf.namespace(namespace_name)
+                await namespace.delete_all()
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not settings.tpuf_api_key, reason="Turbopuffer API key not configured")
+async def test_query_messages_by_org_id_with_missing_conversation_id_schema(enable_message_embedding, default_user):
+    """Test that query_messages_by_org_id works when the namespace doesn't have conversation_id in schema.
+
+    This is the companion test to test_query_messages_with_mixed_conversation_id_presence,
+    validating the same fix for the query_messages_by_org_id method.
+
+    IMPORTANT: This test queries BEFORE any messages with conversation_id are inserted,
+    to reproduce the exact production scenario.
+    """
+    from turbopuffer import AsyncTurbopuffer
+
+    from letta.helpers.tpuf_client import TurbopufferClient
+
+    client = TurbopufferClient()
+    agent_id = f"test-agent-{uuid.uuid4()}"
+    org_id = str(uuid.uuid4())
+    namespace_name = f"messages_{org_id}_dev"
+
+    try:
+        # Insert messages using raw Turbopuffer API WITHOUT conversation_id in schema
+        message_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        message_texts = ["Org message about Python", "Org message about JavaScript"]
+
+        # Generate embeddings
+        embeddings = await client._generate_embeddings(message_texts, default_user)
+
+        # Use raw Turbopuffer API to insert WITHOUT conversation_id in schema
+        async with AsyncTurbopuffer(api_key=client.api_key, region=client.region) as tpuf:
+            namespace = tpuf.namespace(namespace_name)
+            await namespace.write(
+                upsert_columns={
+                    "id": message_ids,
+                    "vector": embeddings,
+                    "text": message_texts,
+                    "organization_id": [org_id, org_id],
+                    "agent_id": [agent_id, agent_id],
+                    "role": ["user", "assistant"],
+                    "created_at": [datetime.now(timezone.utc), datetime.now(timezone.utc)],
+                    # NOTE: No conversation_id column
+                },
+                distance_metric="cosine_distance",
+                schema={
+                    "text": {"type": "string", "full_text_search": True},
+                    # NOTE: No conversation_id in schema
+                },
+            )
+
+        # Wait for indexing
+        await asyncio.sleep(1)
+
+        # CRITICAL: Query BEFORE inserting any new messages with conversation_id
+        # This is when the bug manifests - schema doesn't have conversation_id
+
+        # Query at org level - should work even without conversation_id in schema
+        org_results = await client.query_messages_by_org_id(
+            organization_id=org_id,
+            actor=default_user,
+            query_text="message",
+            search_mode="hybrid",
+            top_k=10,
+            vector_weight=0.5,
+            fts_weight=0.5,
+        )
+
+        # Should find both messages
+        assert len(org_results) == 2, f"Expected 2 messages, got {len(org_results)}"
+        result_ids = [msg["id"] for msg, _, _ in org_results]
+        assert message_ids[0] in result_ids
+        assert message_ids[1] in result_ids
+
+    finally:
+        # Clean up - delete the entire namespace
+        try:
+            async with AsyncTurbopuffer(api_key=client.api_key, region=client.region) as tpuf:
+                namespace = tpuf.namespace(namespace_name)
+                await namespace.delete_all()
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
 async def test_system_messages_not_embedded_during_agent_creation(server, default_user, enable_message_embedding):
     """Test that system messages are filtered out before being passed to the embedding pipeline during agent creation"""
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import patch
 
     from letta.schemas.agent import CreateAgent
     from letta.schemas.llm_config import LLMConfig
@@ -2219,5 +2533,5 @@ async def test_system_messages_not_embedded_during_agent_creation(server, defaul
         # Clean up
         try:
             await server.agent_manager.delete_agent_async(agent.id, default_user)
-        except:
+        except Exception:
             pass

@@ -1,4 +1,3 @@
-import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -17,7 +16,7 @@ from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
 from letta.services.helpers.agent_manager_helper import validate_agent_exists_async
 from letta.settings import DatabaseChoice, settings
-from letta.utils import enforce_types
+from letta.utils import bounded_gather, decrypt_agent_secrets, enforce_types
 from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
@@ -31,7 +30,7 @@ class ArchiveManager:
     async def create_archive_async(
         self,
         name: str,
-        embedding_config: EmbeddingConfig,
+        embedding_config: Optional[EmbeddingConfig] = None,
         description: Optional[str] = None,
         actor: PydanticUser = None,
     ) -> PydanticArchive:
@@ -55,8 +54,8 @@ class ArchiveManager:
             raise
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def get_archive_by_id_async(
         self,
         archive_id: str,
@@ -72,8 +71,8 @@ class ArchiveManager:
             return archive.to_pydantic()
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def update_archive_async(
         self,
         archive_id: str,
@@ -99,8 +98,8 @@ class ArchiveManager:
             return archive.to_pydantic()
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @trace_method
     async def list_archives_async(
         self,
         *,
@@ -150,9 +149,9 @@ class ArchiveManager:
             return [a.to_pydantic() for a in archives]
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def attach_agent_to_archive_async(
         self,
         agent_id: str,
@@ -191,12 +190,13 @@ class ArchiveManager:
                 is_owner=is_owner,
             )
             session.add(archives_agents)
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def detach_agent_from_archive_async(
         self,
         agent_id: str,
@@ -224,11 +224,12 @@ class ArchiveManager:
             else:
                 logger.info(f"Detached agent {agent_id} from archive {archive_id}")
 
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @trace_method
     async def get_default_archive_for_agent_async(
         self,
         agent_id: str,
@@ -260,8 +261,8 @@ class ArchiveManager:
         return None
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def delete_archive_async(
         self,
         archive_id: str,
@@ -278,14 +279,15 @@ class ArchiveManager:
             logger.info(f"Deleted archive {archive_id}")
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def create_passage_in_archive_async(
         self,
         archive_id: str,
         text: str,
         metadata: Optional[Dict] = None,
         tags: Optional[List[str]] = None,
+        created_at: Optional[str] = None,
         actor: PydanticUser = None,
     ) -> PydanticPassage:
         """Create a passage in an archive.
@@ -295,6 +297,7 @@ class ArchiveManager:
             text: The text content of the passage
             metadata: Optional metadata for the passage
             tags: Optional tags for categorizing the passage
+            created_at: Optional creation datetime in ISO 8601 format
             actor: User performing the operation
 
         Returns:
@@ -309,13 +312,20 @@ class ArchiveManager:
         # Verify the archive exists and user has access
         archive = await self.get_archive_by_id_async(archive_id=archive_id, actor=actor)
 
-        # Generate embeddings for the text
-        embedding_client = LLMClient.create(
-            provider_type=archive.embedding_config.embedding_endpoint_type,
-            actor=actor,
-        )
-        embeddings = await embedding_client.request_embeddings([text], archive.embedding_config)
-        embedding = embeddings[0] if embeddings else None
+        # Generate embeddings for the text if embedding config is available
+        embedding = None
+        if archive.embedding_config is not None:
+            embedding_client = LLMClient.create(
+                provider_type=archive.embedding_config.embedding_endpoint_type,
+                actor=actor,
+            )
+            embeddings = await embedding_client.request_embeddings([text], archive.embedding_config)
+            embedding = embeddings[0] if embeddings else None
+
+        # Parse created_at from ISO string if provided
+        parsed_created_at = None
+        if created_at:
+            parsed_created_at = datetime.fromisoformat(created_at)
 
         # Create the passage object with embedding
         passage = PydanticPassage(
@@ -326,6 +336,7 @@ class ArchiveManager:
             tags=tags,
             embedding_config=archive.embedding_config,
             embedding=embedding,
+            created_at=parsed_created_at,
         )
 
         # Use PassageManager to create the passage
@@ -342,13 +353,14 @@ class ArchiveManager:
 
                 tpuf_client = TurbopufferClient()
 
-                # Insert to Turbopuffer with the same ID as SQL
+                # Insert to Turbopuffer with the same ID as SQL, reusing existing embedding
                 await tpuf_client.insert_archival_memories(
                     archive_id=archive.id,
                     text_chunks=[created_passage.text],
                     passage_ids=[created_passage.id],
                     organization_id=actor.organization_id,
                     actor=actor,
+                    embeddings=[created_passage.embedding],
                 )
                 logger.info(f"Uploaded passage {created_passage.id} to Turbopuffer for archive {archive_id}")
             except Exception as e:
@@ -360,9 +372,95 @@ class ArchiveManager:
         return created_passage
 
     @enforce_types
+    @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     @trace_method
+    async def create_passages_in_archive_async(
+        self,
+        archive_id: str,
+        passages: List[Dict],
+        actor: PydanticUser = None,
+    ) -> List[PydanticPassage]:
+        """Create multiple passages in an archive.
+
+        Args:
+            archive_id: ID of the archive to add the passages to
+            passages: Passage create payloads
+            actor: User performing the operation
+
+        Returns:
+            The created passages
+
+        Raises:
+            NoResultFound: If archive not found
+        """
+        if not passages:
+            return []
+
+        from letta.llm_api.llm_client import LLMClient
+        from letta.services.passage_manager import PassageManager
+
+        archive = await self.get_archive_by_id_async(archive_id=archive_id, actor=actor)
+
+        texts = [passage["text"] for passage in passages]
+        embedding_client = LLMClient.create(
+            provider_type=archive.embedding_config.embedding_endpoint_type,
+            actor=actor,
+        )
+        embeddings = await embedding_client.request_embeddings(texts, archive.embedding_config)
+
+        if len(embeddings) != len(passages):
+            raise ValueError("Embedding response count does not match passages count")
+
+        # Build PydanticPassage objects for batch creation
+        pydantic_passages: List[PydanticPassage] = []
+        for passage_payload, embedding in zip(passages, embeddings):
+            # Parse created_at from ISO string if provided
+            created_at = passage_payload.get("created_at")
+            if created_at and isinstance(created_at, str):
+                created_at = datetime.fromisoformat(created_at)
+
+            passage = PydanticPassage(
+                text=passage_payload["text"],
+                archive_id=archive_id,
+                organization_id=actor.organization_id,
+                metadata=passage_payload.get("metadata") or {},
+                tags=passage_payload.get("tags"),
+                embedding_config=archive.embedding_config,
+                embedding=embedding,
+                created_at=created_at,
+            )
+            pydantic_passages.append(passage)
+
+        # Use batch create for efficient single-transaction insert
+        passage_manager = PassageManager()
+        created_passages = await passage_manager.create_agent_passages_async(
+            pydantic_passages=pydantic_passages,
+            actor=actor,
+        )
+
+        if archive.vector_db_provider == VectorDBProvider.TPUF:
+            try:
+                from letta.helpers.tpuf_client import TurbopufferClient
+
+                tpuf_client = TurbopufferClient()
+                await tpuf_client.insert_archival_memories(
+                    archive_id=archive.id,
+                    text_chunks=[passage.text for passage in created_passages],
+                    passage_ids=[passage.id for passage in created_passages],
+                    organization_id=actor.organization_id,
+                    actor=actor,
+                )
+                logger.info(f"Uploaded {len(created_passages)} passages to Turbopuffer for archive {archive_id}")
+            except Exception as e:
+                logger.error(f"Failed to upload passages to Turbopuffer: {e}")
+
+        logger.info(f"Created {len(created_passages)} passages in archive {archive_id}")
+        return created_passages
+
+    @enforce_types
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
     @raise_on_invalid_id(param_name="passage_id", expected_prefix=PrimitiveType.PASSAGE)
+    @trace_method
     async def delete_passage_from_archive_async(
         self,
         archive_id: str,
@@ -430,7 +528,7 @@ class ArchiveManager:
             )
             return archive
 
-        # Create a default archive for this agent
+        # Create a default archive for this agent (embedding_config is optional)
         archive_name = f"{agent_state.name}'s Archive"
         archive = await self.create_archive_async(
             name=archive_name,
@@ -470,8 +568,8 @@ class ArchiveManager:
                 raise
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def get_agents_for_archive_async(
         self,
         archive_id: str,
@@ -549,8 +647,13 @@ class ArchiveManager:
             result = await session.execute(query)
             agents_orm = result.scalars().all()
 
-            agents = await asyncio.gather(*[agent.to_pydantic_async(include_relationships=[], include=include) for agent in agents_orm])
-            return agents
+            # Convert without decrypting to release DB connection before PBKDF2
+            agents_encrypted = await bounded_gather(
+                [agent.to_pydantic_async(include_relationships=[], include=include, decrypt=False) for agent in agents_orm]
+            )
+
+        # Decrypt secrets outside session
+        return await decrypt_agent_secrets(agents_encrypted)
 
     @enforce_types
     @trace_method
@@ -583,8 +686,8 @@ class ArchiveManager:
             return agent_ids[0]
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="archive_id", expected_prefix=PrimitiveType.ARCHIVE)
+    @trace_method
     async def get_or_set_vector_db_namespace_async(
         self,
         archive_id: str,
@@ -609,6 +712,7 @@ class ArchiveManager:
 
             # update the archive with the namespace
             await session.execute(update(ArchiveModel).where(ArchiveModel.id == archive_id).values(_vector_db_namespace=namespace_name))
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
 
             return namespace_name

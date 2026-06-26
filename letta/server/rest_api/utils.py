@@ -5,7 +5,7 @@ import uuid
 from enum import Enum
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Union, cast
 
-from fastapi import Header, HTTPException
+from fastapi import HTTPException
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall, Function as OpenAIFunction
 from openai.types.chat.completion_create_params import CompletionCreateParams
@@ -20,7 +20,7 @@ from letta.constants import (
 )
 from letta.errors import ContextWindowExceededError, RateLimitExceededError
 from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns, ns_to_ms
-from letta.helpers.message_helper import convert_message_creates_to_messages
+from letta.helpers.message_helper import convert_message_creates_to_messages, resolve_tool_return_images
 from letta.log import get_logger
 from letta.otel.context import get_ctx_attributes
 from letta.otel.metric_registry import MetricRegistry
@@ -37,6 +37,7 @@ from letta.schemas.letta_message_content import (
 )
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import ApprovalCreate, Message, MessageCreate, ToolReturn
+from letta.schemas.provider_trace import BillingContext
 from letta.schemas.tool_execution_result import ToolExecutionResult
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
@@ -171,18 +172,26 @@ async def create_input_messages(
     return messages
 
 
-def create_approval_response_message_from_input(
+async def create_approval_response_message_from_input(
     agent_state: AgentState, input_message: ApprovalCreate, run_id: Optional[str] = None
 ) -> List[Message]:
-    def maybe_convert_tool_return_message(maybe_tool_return: LettaToolReturn):
+    async def maybe_convert_tool_return_message(maybe_tool_return: LettaToolReturn):
         if isinstance(maybe_tool_return, LettaToolReturn):
-            packaged_function_response = package_function_response(
-                maybe_tool_return.status == "success", maybe_tool_return.tool_return, agent_state.timezone
-            )
+            tool_return_content = maybe_tool_return.tool_return
+
+            # Handle tool_return content - can be string or list of content parts (text/image)
+            if isinstance(tool_return_content, str):
+                # String content - wrap with package_function_response as before
+                func_response = package_function_response(maybe_tool_return.status == "success", tool_return_content, agent_state.timezone)
+            else:
+                # List of content parts (text/image) - resolve URL images to base64 first
+                resolved_content = await resolve_tool_return_images(tool_return_content)
+                func_response = resolved_content
+
             return ToolReturn(
                 tool_call_id=maybe_tool_return.tool_call_id,
                 status=maybe_tool_return.status,
-                func_response=packaged_function_response,
+                func_response=func_response,
                 stdout=maybe_tool_return.stdout,
                 stderr=maybe_tool_return.stderr,
             )
@@ -196,6 +205,11 @@ def create_approval_response_message_from_input(
             getattr(input_message, "approval_request_id", None),
         )
 
+    # Process all tool returns concurrently (for async image resolution)
+    import asyncio
+
+    converted_approvals = await asyncio.gather(*[maybe_convert_tool_return_message(approval) for approval in approvals_list])
+
     return [
         Message(
             role=MessageRole.approval,
@@ -204,13 +218,87 @@ def create_approval_response_message_from_input(
             approval_request_id=input_message.approval_request_id,
             approve=input_message.approve,
             denial_reason=input_message.reason,
-            approvals=[maybe_convert_tool_return_message(approval) for approval in approvals_list],
+            approvals=list(converted_approvals),
             run_id=run_id,
             group_id=input_message.group_id
             if input_message.group_id
             else (agent_state.multi_agent_group.id if agent_state.multi_agent_group else None),
         )
     ]
+
+
+def create_tool_returns_for_denials(
+    tool_calls: List[OpenAIToolCall],
+    denial_reason: str,
+    timezone: str,
+) -> List[ToolReturn]:
+    """
+    Create ToolReturn objects with error status for denied tool calls.
+
+    This is used when tool calls are denied either by:
+    - User explicitly denying approval
+    - Run cancellation (automated denial)
+
+    Args:
+        tool_calls: List of tool calls that were denied
+        denial_reason: Reason for denial (e.g., user reason or cancellation message)
+        timezone: Agent timezone for timestamp formatting
+
+    Returns:
+        List of ToolReturn objects with error status
+    """
+    tool_returns = []
+    for tool_call in tool_calls:
+        tool_call_id = tool_call.id or f"call_{uuid.uuid4().hex[:8]}"
+        packaged_function_response = package_function_response(
+            was_success=False,
+            response_string=f"Error: request to call tool denied. User reason: {denial_reason}",
+            timezone=timezone,
+        )
+        tool_return = ToolReturn(
+            tool_call_id=tool_call_id,
+            func_response=packaged_function_response,
+            status="error",
+        )
+        tool_returns.append(tool_return)
+    return tool_returns
+
+
+def create_tool_message_from_returns(
+    agent_id: str,
+    model: str,
+    tool_returns: List[ToolReturn],
+    run_id: Optional[str] = None,
+    step_id: Optional[str] = None,
+) -> Message:
+    """
+    Create a tool message with error returns for denied/failed tool calls.
+
+    This creates a properly formatted tool message that can be added to the
+    conversation history to reflect tool call denials or failures.
+
+    Args:
+        agent_id: ID of the agent
+        model: Model identifier
+        tool_returns: List of ToolReturn objects (typically with error status)
+        run_id: Optional run ID
+        step_id: Optional step ID
+
+    Returns:
+        Message with role="tool" containing the tool returns
+    """
+    return Message(
+        role=MessageRole.tool,
+        content=[TextContent(text=tr.func_response) for tr in tool_returns],
+        agent_id=agent_id,
+        model=model,
+        tool_calls=[],
+        tool_call_id=tool_returns[0].tool_call_id if tool_returns else None,
+        tool_returns=tool_returns,
+        run_id=run_id,
+        step_id=step_id,
+        created_at=get_utc_time(),
+    )
 
 
 def create_approval_request_message_from_llm_response(
@@ -221,7 +309,7 @@ def create_approval_request_message_from_llm_response(
     reasoning_content: Optional[List[Union[TextContent, ReasoningContent, RedactedReasoningContent, OmittedReasoningContent]]] = None,
     pre_computed_assistant_message_id: Optional[str] = None,
     step_id: str | None = None,
-    run_id: str = None,
+    run_id: str | None = None,
 ) -> Message:
     messages = []
     if allowed_tool_calls:
@@ -277,6 +365,8 @@ def create_approval_request_message_from_llm_response(
     )
     if pre_computed_assistant_message_id:
         approval_message.id = decrement_message_uuid(pre_computed_assistant_message_id)
+    # Set otid to match streaming interface pattern (index -1 returns id unchanged)
+    approval_message.otid = Message.generate_otid_from_id(approval_message.id, -1)
     messages.append(approval_message)
     return messages
 
@@ -299,7 +389,7 @@ def create_letta_messages_from_llm_response(
     function_response: Optional[str],
     timezone: str,
     run_id: str | None = None,
-    step_id: str = None,
+    step_id: str | None = None,
     continue_stepping: bool = False,
     heartbeat_reason: Optional[str] = None,
     reasoning_content: Optional[
@@ -334,7 +424,7 @@ def create_letta_messages_from_llm_response(
             content = []
             if reasoning_content:
                 for content_part in reasoning_content:
-                    if isinstance(content_part, TextContent) and content_part.text == "":
+                    if isinstance(content_part, TextContent) and content_part.text == "" and content_part.signature is None:
                         continue
                     content.append(content_part)
 
@@ -354,7 +444,7 @@ def create_letta_messages_from_llm_response(
             content = []
             if reasoning_content:
                 for content_part in reasoning_content:
-                    if isinstance(content_part, TextContent) and content_part.text == "":
+                    if isinstance(content_part, TextContent) and content_part.text == "" and content_part.signature is None:
                         continue
                     content.append(content_part)
 
@@ -482,7 +572,7 @@ def create_parallel_tool_messages_from_llm_response(
         ] = []
         if reasoning_content:
             for content_part in reasoning_content:
-                if isinstance(content_part, TextContent) and content_part.text == "":
+                if isinstance(content_part, TextContent) and content_part.text == "" and content_part.signature is None:
                     continue
                 content.append(content_part)
 
@@ -523,9 +613,10 @@ def create_parallel_tool_messages_from_llm_response(
         agent_id=agent_id,
         model=model,
         tool_calls=[],
-        tool_call_id=tool_returns[0].tool_call_id,  # For legacy reasons, set to first one
+        tool_call_id=tool_returns[0].tool_call_id if tool_returns else None,  # For legacy reasons, set to first one
         created_at=get_utc_time(),
         batch_item_id=llm_batch_item_id,
+        name=tool_call_specs[0].get("name") if tool_call_specs else None,  # For legacy reasons, set to first one
         tool_returns=tool_returns,
         run_id=run_id,
     )
@@ -711,6 +802,7 @@ async def capture_and_persist_messages(
     user_messages: list[str],
     assistant_message: str,
     model: Optional[str] = None,
+    billing_context: BillingContext | None = None,
 ) -> Dict[str, Any]:
     """
     Capture user and assistant messages and persist them to the database.
@@ -772,7 +864,7 @@ async def capture_and_persist_messages(
 
             sleeptime_agent_loop = SleeptimeMultiAgentV4(agent_state=agent, actor=actor, group=sleeptime_group)
             sleeptime_agent_loop.response_messages = response_messages
-            run_ids = await sleeptime_agent_loop.run_sleeptime_agents()
+            run_ids = await sleeptime_agent_loop.run_sleeptime_agents(billing_context=billing_context)
             logger.info(f"Triggered sleeptime agents, run_ids: {run_ids}")
 
     except Exception as e:
@@ -783,95 +875,3 @@ async def capture_and_persist_messages(
         "messages_created": len(response_messages),
         "run_ids": run_ids,
     }
-
-
-async def get_or_create_claude_code_agent(
-    server,
-    actor,
-):
-    """
-    Get or create a special agent for Claude Code sessions.
-
-    Args:
-        server: SyncServer instance
-        actor: Actor performing the operation (user ID)
-
-    Returns:
-        Agent ID
-    """
-    from letta.schemas.agent import CreateAgent
-
-    # Create short user identifier from UUID (first 8 chars)
-    if actor:
-        user_short_id = str(actor.id)[:8] if hasattr(actor, "id") else str(actor)[:8]
-    else:
-        user_short_id = "default"
-
-    agent_name = f"claude-code-{user_short_id}"
-
-    try:
-        # Try to find existing agent by name (most reliable)
-        # Note: Search by name only, not tags, since name is unique and more reliable
-        logger.debug(f"Searching for agent with name: {agent_name}")
-        agents = await server.agent_manager.list_agents_async(
-            actor=actor,
-            limit=10,  # Get a few in case of duplicates
-            name=agent_name,
-            include=["agent.blocks", "agent.managed_group", "agent.tags"],
-        )
-
-        # list_agents_async returns a list directly, not an object with .agents
-        logger.debug(f"Agent search returned {len(agents) if agents else 0} results")
-        if agents and len(agents) > 0:
-            # Return the first matching agent
-            logger.info(f"Found existing Claude Code agent: {agents[0].id} (name: {agent_name})")
-            return agents[0]
-        else:
-            logger.debug(f"No existing agent found with name: {agent_name}")
-
-    except Exception as e:
-        logger.warning(f"Could not find existing agent: {e}", exc_info=True)
-
-    # Create new agent
-    try:
-        logger.info(f"Creating new Claude Code agent: {agent_name}")
-
-        # Create minimal agent config
-        agent_config = CreateAgent(
-            name=agent_name,
-            description="Agent for capturing Claude Code conversations",
-            memory_blocks=[
-                {
-                    "label": "human",
-                    "value": "This is my section of core memory devoted to information about the human.\nI don't yet know anything about them.\nWhat's their name? Where are they from? What do they do? Who are they?\nI should update this memory over time as I interact with the human and learn more about them.",
-                    "description": "A memory block for keeping track of the human (user) the agent is interacting with.",
-                },
-                {
-                    "label": "persona",
-                    "value": "This is my section of core memory devoted to information myself.\nThere's nothing here yet.\nI should update this memory over time as I develop my personality.",
-                    "description": "A memory block for storing the agent's core personality details and behavior profile.",
-                },
-                {
-                    "label": "project",
-                    "value": "This is my section of core memory devoted to information about what the agent is working on.\nI don't yet know anything about it.\nI should update this memory over time with high level understanding and learnings.",
-                    "description": "A memory block for storing the information about the project the agent is working on.",
-                },
-            ],
-            tags=["claude-code"],
-            enable_sleeptime=True,
-            agent_type="letta_v1_agent",
-            model="anthropic/claude-sonnet-4-5-20250929",
-            embedding="openai/text-embedding-ada-002",
-        )
-
-        new_agent = await server.create_agent_async(
-            request=agent_config,
-            actor=actor,
-        )
-
-        logger.info(f"Created Claude Code agent {new_agent.name}: {new_agent.id}")
-        return new_agent
-
-    except Exception as e:
-        logger.exception(f"Failed to create Claude Code agent: {e}")
-        raise

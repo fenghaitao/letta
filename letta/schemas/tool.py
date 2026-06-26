@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import ConfigDict, Field, model_validator
 
@@ -20,7 +20,7 @@ from letta.functions.functions import get_json_schema_from_module
 from letta.functions.mcp_client.types import MCPTool
 from letta.functions.schema_generator import generate_tool_schema_for_mcp
 from letta.log import get_logger
-from letta.schemas.enums import ToolSourceType, ToolType
+from letta.schemas.enums import ToolType
 from letta.schemas.letta_base import LettaBase
 from letta.schemas.npm_requirement import NpmRequirement
 from letta.schemas.pip_requirement import PipRequirement
@@ -67,6 +67,9 @@ class Tool(BaseTool):
     created_by_id: Optional[str] = Field(None, description="The id of the user that made this Tool.")
     last_updated_by_id: Optional[str] = Field(None, description="The id of the user that made this Tool.")
     metadata_: Optional[Dict[str, Any]] = Field(default_factory=dict, description="A dictionary of additional metadata for the tool.")
+
+    # project scoping
+    project_id: Optional[str] = Field(None, description="The project id of the tool.")
 
     @model_validator(mode="after")
     def refresh_source_code_and_json_schema(self):
@@ -126,6 +129,19 @@ class ToolCreate(LettaBase):
         False, description="If set to True, then this tool will potentially be executed concurrently with other tools. Default False."
     )
 
+    @model_validator(mode="after")
+    def validate_typescript_requires_schema(self):
+        """
+        TypeScript tools require an explicit json_schema since we don't support
+        docstring parsing for TypeScript.
+        """
+        if self.source_type == "typescript" and not self.json_schema:
+            raise ValueError(
+                "TypeScript tools require an explicit json_schema parameter. "
+                "Unlike Python tools, schema cannot be auto-generated from TypeScript source code."
+            )
+        return self
+
     @classmethod
     def from_mcp(cls, mcp_server_name: str, mcp_tool: MCPTool) -> "ToolCreate":
         from letta.functions.helpers import generate_mcp_tool_wrapper
@@ -142,7 +158,7 @@ class ToolCreate(LettaBase):
         description = mcp_tool.description
         source_type = "python"
         tags = [f"{MCP_TOOL_TAG_NAME_PREFIX}:{mcp_server_name}"]
-        wrapper_func_name, wrapper_function_str = generate_mcp_tool_wrapper(mcp_tool.name)
+        _wrapper_func_name, wrapper_function_str = generate_mcp_tool_wrapper(mcp_tool.name)
 
         return cls(
             description=description,
@@ -206,3 +222,23 @@ class ToolRunFromSource(LettaBase):
     )
     pip_requirements: list[PipRequirement] | None = Field(None, description="Optional list of pip packages required by this tool.")
     npm_requirements: list[NpmRequirement] | None = Field(None, description="Optional list of npm packages required by this tool.")
+
+
+class ToolSearchRequest(LettaBase):
+    """Request model for searching tools using semantic search."""
+
+    query: Optional[str] = Field(None, description="Text query for semantic search.")
+    search_mode: Literal["vector", "fts", "hybrid"] = Field("hybrid", description="Search mode: vector, fts, or hybrid.")
+    tool_types: Optional[List[str]] = Field(None, description="Filter by tool types (e.g., 'custom', 'letta_core').")
+    tags: Optional[List[str]] = Field(None, description="Filter by tags (match any).")
+    limit: int = Field(50, description="Maximum number of results to return.", ge=1, le=100)
+
+
+class ToolSearchResult(LettaBase):
+    """Result from a tool search operation."""
+
+    tool: Tool = Field(..., description="The matched tool.")
+    embedded_text: Optional[str] = Field(None, description="The embedded text content used for matching.")
+    fts_rank: Optional[int] = Field(None, description="Full-text search rank position.")
+    vector_rank: Optional[int] = Field(None, description="Vector search rank position.")
+    combined_score: float = Field(..., description="Combined relevance score (RRF for hybrid mode).")

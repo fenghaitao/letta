@@ -2,32 +2,29 @@ import asyncio
 import json
 import os
 import traceback
-from abc import abstractmethod
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import httpx
 from anthropic import AsyncAnthropic
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
 
 import letta.constants as constants
 import letta.server.utils as server_utils
-import letta.system as system
 from letta.config import LettaConfig
 from letta.constants import LETTA_TOOL_EXECUTION_DIR
 from letta.data_sources.connectors import DataConnector, load_data
-from letta.errors import HandleNotFoundError, LettaInvalidArgumentError, LettaMCPConnectionError, LettaMCPTimeoutError
+from letta.errors import (
+    HandleNotFoundError,
+    LettaInvalidArgumentError,
+    LettaMCPConnectionError,
+)
 from letta.functions.mcp_client.types import MCPServerType, MCPTool, MCPToolHealth, SSEServerConfig, StdioServerConfig
 from letta.functions.schema_validator import validate_complete_json_schema
-from letta.groups.helpers import load_multi_agent
 from letta.helpers.datetime_helpers import get_utc_time
-from letta.helpers.json_helpers import json_dumps, json_loads
 
 # TODO use custom interface
 from letta.interface import (
-    AgentInterface,  # abstract
     CLIInterface,  # for printing to terminal
 )
 from letta.log import get_logger
@@ -39,22 +36,19 @@ from letta.schemas.block import Block, BlockUpdate, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 
 # openai schemas
-from letta.schemas.enums import AgentType, JobStatus, MessageStreamStatus, ProviderCategory, ProviderType, SandboxType, ToolSourceType
-from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate
-from letta.schemas.group import GroupCreate, ManagerType, SleeptimeManager, VoiceSleeptimeManager
+from letta.schemas.enums import AgentType, JobStatus, ProviderCategory, ProviderType, ToolSourceType
+from letta.schemas.group import GroupCreate, SleeptimeManager, VoiceSleeptimeManager
 from letta.schemas.job import Job, JobUpdate
-from letta.schemas.letta_message import LegacyLettaMessage, LettaMessage, MessageType, ToolReturnMessage
-from letta.schemas.letta_message_content import TextContent
-from letta.schemas.letta_response import LettaResponse
-from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
+from letta.schemas.letta_message import LettaMessage, MessageType, ToolReturnMessage
 from letta.schemas.llm_config import LLMConfig
-from letta.schemas.memory import ArchivalMemorySummary, Memory, RecallMemorySummary
-from letta.schemas.message import Message, MessageCreate, MessageUpdate
+from letta.schemas.memory import Memory
+from letta.schemas.message import Message
 from letta.schemas.passage import Passage
 from letta.schemas.pip_requirement import PipRequirement
 from letta.schemas.providers import (
     AnthropicProvider,
     AzureProvider,
+    BasetenProvider,
     BedrockProvider,
     DeepSeekProvider,
     GoogleAIProvider,
@@ -62,26 +56,27 @@ from letta.schemas.providers import (
     GroqProvider,
     LettaProvider,
     LMStudioOpenAIProvider,
+    MiniMaxProvider,
     OllamaProvider,
     OpenAIProvider,
     OpenRouterProvider,
     Provider,
+    SGLangProvider,
     TogetherProvider,
     VLLMProvider,
     XAIProvider,
+    ZAIProvider,
 )
 from letta.schemas.sandbox_config import LocalSandboxConfig, SandboxConfigCreate
+from letta.schemas.secret import Secret
 from letta.schemas.source import Source
 from letta.schemas.tool import Tool
-from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
-from letta.server.rest_api.chat_completions_interface import ChatCompletionsStreamingInterface
-from letta.server.rest_api.interface import StreamingServerInterface
-from letta.server.rest_api.utils import sse_async_generator
 from letta.services.agent_manager import AgentManager
 from letta.services.agent_serialization_manager import AgentSerializationManager
 from letta.services.archive_manager import ArchiveManager
 from letta.services.block_manager import BlockManager
+from letta.services.block_manager_git import GIT_MEMORY_ENABLED_TAG, GitEnabledBlockManager
 from letta.services.file_manager import FileManager
 from letta.services.files_agents_manager import FileAgentManager
 from letta.services.group_manager import GroupManager
@@ -90,10 +85,12 @@ from letta.services.identity_manager import IdentityManager
 from letta.services.job_manager import JobManager
 from letta.services.llm_batch_manager import LLMBatchManager
 from letta.services.mcp.base_client import AsyncBaseMCPClient
-from letta.services.mcp.sse_client import MCP_CONFIG_TOPLEVEL_KEY, AsyncSSEMCPClient
+from letta.services.mcp.fastmcp_client import AsyncFastMCPSSEClient
+from letta.services.mcp.sse_client import MCP_CONFIG_TOPLEVEL_KEY
 from letta.services.mcp.stdio_client import AsyncStdioMCPClient
 from letta.services.mcp_manager import MCPManager
 from letta.services.mcp_server_manager import MCPServerManager
+from letta.services.memory_repo import MemfsClient
 from letta.services.message_manager import MessageManager
 from letta.services.organization_manager import OrganizationManager
 from letta.services.passage_manager import PassageManager
@@ -108,7 +105,7 @@ from letta.services.tool_manager import ToolManager
 from letta.services.user_manager import UserManager
 from letta.settings import DatabaseChoice, model_settings, settings, tool_settings
 from letta.streaming_interface import AgentChunkStreamingInterface
-from letta.utils import get_friendly_error_msg, get_persona_text, make_key, safe_create_task
+from letta.utils import get_friendly_error_msg, get_persona_text
 
 config = LettaConfig.load()
 logger = get_logger(__name__)
@@ -155,13 +152,19 @@ class SyncServer(object):
         self.tool_manager = ToolManager()
         self.mcp_manager = MCPManager()
         self.mcp_server_manager = MCPServerManager()
-        self.block_manager = BlockManager()
+        self.memory_repo_manager = self._init_memory_repo_manager()
+        # Use git-enabled block manager if memory repo is configured
+        # It falls back to standard PostgreSQL behavior when git isn't enabled for an agent
+        if self.memory_repo_manager:
+            self.block_manager = GitEnabledBlockManager(memory_repo_manager=self.memory_repo_manager)
+        else:
+            self.block_manager = BlockManager()
         self.source_manager = SourceManager()
         self.sandbox_config_manager = SandboxConfigManager()
         self.message_manager = MessageManager()
         self.job_manager = JobManager()
         self.run_manager = RunManager()
-        self.agent_manager = AgentManager()
+        self.agent_manager = AgentManager(block_manager=self.block_manager)
         self.archive_manager = ArchiveManager()
         self.provider_manager = ProviderManager()
         self.step_manager = StepManager()
@@ -171,6 +174,11 @@ class SyncServer(object):
         self.telemetry_manager = TelemetryManager()
         self.file_agent_manager = FileAgentManager()
         self.file_manager = FileManager()
+
+        # Import and initialize the agent generate completion manager
+        from letta.services.agent_generate_completion_manager import AgentGenerateCompletionManager
+
+        self.agent_generate_completion_manager = AgentGenerateCompletionManager(server=self)
 
         self.agent_serialization_manager = AgentSerializationManager(
             agent_manager=self.agent_manager,
@@ -202,17 +210,15 @@ class SyncServer(object):
         """Initialize the MCP clients (there may be multiple)"""
         self.mcp_clients: Dict[str, AsyncBaseMCPClient] = {}
 
-        # TODO: Remove these in memory caches
-        self._llm_config_cache = {}
-        self._embedding_config_cache = {}
-
         # collect providers (always has Letta as a default)
-        self._enabled_providers: List[Provider] = [LettaProvider(name="letta")]
+        from letta.constants import LETTA_MODEL_ENDPOINT
+
+        self._enabled_providers: List[Provider] = [LettaProvider(name="letta", base_url=LETTA_MODEL_ENDPOINT)]
         if model_settings.openai_api_key:
             self._enabled_providers.append(
                 OpenAIProvider(
                     name="openai",
-                    api_key=model_settings.openai_api_key,
+                    api_key_enc=Secret.from_plaintext(model_settings.openai_api_key),
                     base_url=model_settings.openai_api_base,
                 )
             )
@@ -220,7 +226,7 @@ class SyncServer(object):
             self._enabled_providers.append(
                 AnthropicProvider(
                     name="anthropic",
-                    api_key=model_settings.anthropic_api_key,
+                    api_key_enc=Secret.from_plaintext(model_settings.anthropic_api_key),
                 )
             )
         if model_settings.ollama_base_url:
@@ -228,7 +234,6 @@ class SyncServer(object):
                 OllamaProvider(
                     name="ollama",
                     base_url=model_settings.ollama_base_url,
-                    api_key=None,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
                 )
             )
@@ -236,7 +241,7 @@ class SyncServer(object):
             self._enabled_providers.append(
                 GoogleAIProvider(
                     name="google_ai",
-                    api_key=model_settings.gemini_api_key,
+                    api_key_enc=Secret.from_plaintext(model_settings.gemini_api_key),
                 )
             )
         if model_settings.google_cloud_location and model_settings.google_cloud_project:
@@ -252,7 +257,7 @@ class SyncServer(object):
             self._enabled_providers.append(
                 AzureProvider(
                     name="azure",
-                    api_key=model_settings.azure_api_key,
+                    api_key_enc=Secret.from_plaintext(model_settings.azure_api_key),
                     base_url=model_settings.azure_base_url,
                     api_version=model_settings.azure_api_version,
                 )
@@ -261,14 +266,14 @@ class SyncServer(object):
             self._enabled_providers.append(
                 GroqProvider(
                     name="groq",
-                    api_key=model_settings.groq_api_key,
+                    api_key_enc=Secret.from_plaintext(model_settings.groq_api_key),
                 )
             )
         if model_settings.together_api_key:
             self._enabled_providers.append(
                 TogetherProvider(
                     name="together",
-                    api_key=model_settings.together_api_key,
+                    api_key_enc=Secret.from_plaintext(model_settings.together_api_key),
                     default_prompt_formatter=model_settings.default_prompt_formatter,
                 )
             )
@@ -277,12 +282,30 @@ class SyncServer(object):
             # NOTE: to use the /chat/completions endpoint, you need to specify extra flags on vLLM startup
             # see: https://docs.vllm.ai/en/stable/features/tool_calling.html
             # e.g. "... --enable-auto-tool-choice --tool-call-parser hermes"
+            # Auto-append /v1 to the base URL
+            vllm_url = (
+                model_settings.vllm_api_base if model_settings.vllm_api_base.endswith("/v1") else model_settings.vllm_api_base + "/v1"
+            )
             self._enabled_providers.append(
                 VLLMProvider(
                     name="vllm",
-                    base_url=model_settings.vllm_api_base,
+                    base_url=vllm_url,
                     default_prompt_formatter=model_settings.default_prompt_formatter,
                     handle_base=model_settings.vllm_handle_base,
+                )
+            )
+
+        if model_settings.sglang_api_base:
+            # Auto-append /v1 to the base URL
+            sglang_url = (
+                model_settings.sglang_api_base if model_settings.sglang_api_base.endswith("/v1") else model_settings.sglang_api_base + "/v1"
+            )
+            self._enabled_providers.append(
+                SGLangProvider(
+                    name="sglang",
+                    base_url=sglang_url,
+                    default_prompt_formatter=model_settings.default_prompt_formatter,
+                    handle_base=model_settings.sglang_handle_base,
                 )
             )
 
@@ -290,6 +313,8 @@ class SyncServer(object):
             self._enabled_providers.append(
                 BedrockProvider(
                     name="bedrock",
+                    access_key=model_settings.aws_access_key_id,
+                    api_key=model_settings.aws_secret_access_key,
                     region=model_settings.aws_default_region,
                 )
             )
@@ -303,25 +328,65 @@ class SyncServer(object):
             )
             self._enabled_providers.append(LMStudioOpenAIProvider(name="lmstudio_openai", base_url=lmstudio_url))
         if model_settings.deepseek_api_key:
-            self._enabled_providers.append(DeepSeekProvider(name="deepseek", api_key=model_settings.deepseek_api_key))
+            self._enabled_providers.append(
+                DeepSeekProvider(
+                    name="deepseek",
+                    api_key_enc=Secret.from_plaintext(model_settings.deepseek_api_key),
+                )
+            )
         if model_settings.xai_api_key:
-            self._enabled_providers.append(XAIProvider(name="xai", api_key=model_settings.xai_api_key))
+            self._enabled_providers.append(
+                XAIProvider(
+                    name="xai",
+                    api_key_enc=Secret.from_plaintext(model_settings.xai_api_key),
+                )
+            )
+        if model_settings.minimax_api_key:
+            self._enabled_providers.append(
+                MiniMaxProvider(
+                    name="minimax",
+                    api_key_enc=Secret.from_plaintext(model_settings.minimax_api_key),
+                )
+            )
+        if model_settings.baseten_api_key:
+            self._enabled_providers.append(
+                BasetenProvider(
+                    name="baseten",
+                    api_key_enc=Secret.from_plaintext(model_settings.baseten_api_key),
+                )
+            )
+        if model_settings.zai_api_key:
+            self._enabled_providers.append(
+                ZAIProvider(
+                    name="zai",
+                    api_key_enc=Secret.from_plaintext(model_settings.zai_api_key),
+                    base_url=model_settings.zai_base_url,
+                )
+            )
         if model_settings.openrouter_api_key:
             self._enabled_providers.append(
                 OpenRouterProvider(
                     name=model_settings.openrouter_handle_base if model_settings.openrouter_handle_base else "openrouter",
-                    api_key=model_settings.openrouter_api_key,
+                    api_key_enc=Secret.from_plaintext(model_settings.openrouter_api_key),
                 )
             )
 
     async def init_async(self, init_with_default_org_and_user: bool = True):
+        # unfortunately we must always create default org/user
+        self.default_org = await self.organization_manager.create_default_organization_async()
+        self.default_user = await self.user_manager.create_default_actor_async()
+        print(f"Default user: {self.default_user} and org: {self.default_org}")
+
+        # Sync environment-based providers to database (idempotent, safe for multi-pod startup)
+        await self.provider_manager.sync_base_providers(base_providers=self._enabled_providers, actor=self.default_user)
+
+        # Sync provider models to database
+        await self._sync_provider_models_async()
+
+        await self.tool_manager.upsert_base_tools_async(actor=self.default_user)
+
         # Make default user and org
         if init_with_default_org_and_user:
-            self.default_org = await self.organization_manager.create_default_organization_async()
-            self.default_user = await self.user_manager.create_default_actor_async()
-            print(f"Default user: {self.default_user} and org: {self.default_org}")
-            await self.tool_manager.upsert_base_tools_async(actor=self.default_user)
-
             # For OSS users, create a local sandbox config
             oss_default_user = await self.user_manager.get_default_actor_async()
             use_venv = False if not tool_settings.tool_exec_venv_name else True
@@ -358,13 +423,91 @@ class SyncServer(object):
                         force_recreate=True,
                     )
 
+    def _init_memory_repo_manager(self) -> Optional[MemfsClient]:
+        """Initialize the memory repository manager if configured.
+
+        Requires LETTA_MEMFS_SERVICE_URL to be set to the external memfs service URL.
+
+        Returns:
+            MemfsClient if configured, None otherwise
+        """
+        from letta.settings import settings
+
+        if not settings.memfs_service_url:
+            logger.debug("Memory repo manager not configured (memfs_service_url not set)")
+            return None
+
+        logger.info("Memory repo manager using memfs service: %s", settings.memfs_service_url)
+        return MemfsClient(base_url=settings.memfs_service_url)
+
+    def _get_enabled_provider(self, provider_name: str) -> Optional[Provider]:
+        """Find and return an enabled provider by name.
+
+        Args:
+            provider_name: The name of the provider to find
+
+        Returns:
+            The matching enabled provider, or None if not found
+        """
+        for provider in self._enabled_providers:
+            if provider.name == provider_name:
+                return provider
+        return None
+
+    async def _sync_provider_models_async(self):
+        """Sync all provider models to database at startup."""
+        logger.info("Syncing provider models to database")
+
+        # Get persisted providers from database (they now have IDs)
+        persisted_providers = await self.provider_manager.list_providers_async(actor=self.default_user)
+
+        for persisted_provider in persisted_providers:
+            try:
+                # Find the matching enabled provider instance to call list_models on
+                enabled_provider = self._get_enabled_provider(persisted_provider.name)
+
+                if not enabled_provider:
+                    # Only delete base providers that are no longer enabled
+                    # BYOK providers are user-created and should not be automatically deleted
+                    if persisted_provider.provider_category == ProviderCategory.base:
+                        logger.info(f"Base provider {persisted_provider.name} is no longer enabled, deleting from database")
+                        try:
+                            await self.provider_manager.delete_provider_by_id_async(
+                                provider_id=persisted_provider.id, actor=self.default_user
+                            )
+                        except NoResultFound:
+                            # Provider was already deleted (race condition in multi-pod startup)
+                            logger.debug(f"Provider {persisted_provider.name} was already deleted, skipping")
+                    else:
+                        logger.debug(f"No enabled provider for BYOK provider {persisted_provider.name}, skipping model sync")
+                    continue
+
+                # Fetch models from provider
+                llm_models = await enabled_provider.list_llm_models_async()
+                embedding_models = await enabled_provider.list_embedding_models_async()
+
+                # Save to database with the persisted provider (which has an ID)
+                await self.provider_manager.sync_provider_models_async(
+                    provider=persisted_provider,
+                    llm_models=llm_models,
+                    embedding_models=embedding_models,
+                    organization_id=None,  # Global models
+                )
+                # Update last_synced timestamp
+                await self.provider_manager.update_provider_last_synced_async(persisted_provider.id)
+                logger.info(
+                    f"Synced {len(llm_models)} LLM models and {len(embedding_models)} embedding models for provider {persisted_provider.name}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to sync models for provider {persisted_provider.name}: {e}", exc_info=True)
+
     async def init_mcp_clients(self):
         # TODO: remove this
         mcp_server_configs = self.get_mcp_servers()
 
         for server_name, server_config in mcp_server_configs.items():
             if server_config.type == MCPServerType.SSE:
-                self.mcp_clients[server_name] = AsyncSSEMCPClient(server_config)
+                self.mcp_clients[server_name] = AsyncFastMCPSSEClient(server_config)
             elif server_config.type == MCPServerType.STDIO:
                 self.mcp_clients[server_name] = AsyncStdioMCPClient(server_config)
             else:
@@ -384,39 +527,6 @@ class SyncServer(object):
             mcp_tools = await client.list_tools()
             logger.info(f"MCP tools connected: {', '.join([t.name for t in mcp_tools])}")
             logger.debug(f"MCP tools: {', '.join([str(t) for t in mcp_tools])}")
-
-    @trace_method
-    def get_cached_llm_config(self, actor: User, **kwargs):
-        key = make_key(**kwargs)
-        if key not in self._llm_config_cache:
-            self._llm_config_cache[key] = self.get_llm_config_from_handle(actor=actor, **kwargs)
-            logger.info(f"LLM config cache size: {len(self._llm_config_cache)} entries")
-        return self._llm_config_cache[key]
-
-    @trace_method
-    async def get_cached_llm_config_async(self, actor: User, **kwargs):
-        key = make_key(**kwargs)
-        if key not in self._llm_config_cache:
-            self._llm_config_cache[key] = await self.get_llm_config_from_handle_async(actor=actor, **kwargs)
-            logger.info(f"LLM config cache size: {len(self._llm_config_cache)} entries")
-        return self._llm_config_cache[key]
-
-    @trace_method
-    def get_cached_embedding_config(self, actor: User, **kwargs):
-        key = make_key(**kwargs)
-        if key not in self._embedding_config_cache:
-            self._embedding_config_cache[key] = self.get_embedding_config_from_handle(actor=actor, **kwargs)
-            logger.info(f"Embedding config cache size: {len(self._embedding_config_cache)} entries")
-        return self._embedding_config_cache[key]
-
-    # @async_redis_cache(key_func=lambda (actor, **kwargs): actor.id + hash(kwargs))
-    @trace_method
-    async def get_cached_embedding_config_async(self, actor: User, **kwargs):
-        key = make_key(**kwargs)
-        if key not in self._embedding_config_cache:
-            self._embedding_config_cache[key] = await self.get_embedding_config_from_handle_async(actor=actor, **kwargs)
-            logger.info(f"Embedding config cache size: {len(self._embedding_config_cache)} entries")
-        return self._embedding_config_cache[key]
 
     @trace_method
     async def create_agent_async(
@@ -451,10 +561,9 @@ class SyncServer(object):
                 "max_reasoning_tokens": request.max_reasoning_tokens,
                 "enable_reasoner": request.enable_reasoner,
             }
-            config_params.update(additional_config_params)
-            log_event(name="start get_cached_llm_config", attributes=config_params)
-            request.llm_config = await self.get_cached_llm_config_async(actor=actor, **config_params)
-            log_event(name="end get_cached_llm_config", attributes=config_params)
+            log_event(name="start get_llm_config_from_handle", attributes=config_params)
+            request.llm_config = await self.get_llm_config_from_handle_async(actor=actor, **config_params)
+            log_event(name="end get_llm_config_from_handle", attributes=config_params)
             if request.model and isinstance(request.model, str):
                 assert request.llm_config.handle == request.model, (
                     f"LLM config handle {request.llm_config.handle} does not match request handle {request.model}"
@@ -463,6 +572,10 @@ class SyncServer(object):
         # update with model_settings
         if request.model_settings is not None:
             update_llm_config_params = request.model_settings._to_legacy_config_params()
+            # Don't clobber max_tokens with the Pydantic default when the caller
+            # didn't explicitly provide max_output_tokens in the request.
+            if "max_output_tokens" not in request.model_settings.model_fields_set:
+                update_llm_config_params.pop("max_tokens", None)
             request.llm_config = request.llm_config.model_copy(update=update_llm_config_params)
 
         # Copy parallel_tool_calls from request to llm_config if provided
@@ -474,26 +587,62 @@ class SyncServer(object):
 
         if request.embedding_config is None:
             if request.embedding is None:
-                if settings.default_embedding_handle is None:
-                    raise LettaInvalidArgumentError(
-                        "Must specify either embedding or embedding_config in request", argument_name="embedding"
-                    )
-                else:
+                if settings.default_embedding_handle is not None:
                     request.embedding = settings.default_embedding_handle
-            embedding_config_params = {
-                "handle": request.embedding,
-                "embedding_chunk_size": request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
-            }
-            log_event(name="start get_cached_embedding_config", attributes=embedding_config_params)
-            request.embedding_config = await self.get_cached_embedding_config_async(actor=actor, **embedding_config_params)
-            log_event(name="end get_cached_embedding_config", attributes=embedding_config_params)
+            # Only resolve embedding config if we have an embedding handle
+            if request.embedding is not None:
+                embedding_config_params = {
+                    "handle": request.embedding,
+                    "embedding_chunk_size": request.embedding_chunk_size or constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
+                }
+                log_event(name="start get_embedding_config_from_handle", attributes=embedding_config_params)
+                request.embedding_config = await self.get_embedding_config_from_handle_async(actor=actor, **embedding_config_params)
+                log_event(name="end get_embedding_config_from_handle", attributes=embedding_config_params)
+
+        # If git-backed memory is requested on create, we enable it *after* agent creation.
+        # We strip the tag during creation so `enable_git_memory_for_agent` can be the
+        # single place that both creates the repo and writes the tag.
+        wants_git_memory = bool(request.tags and GIT_MEMORY_ENABLED_TAG in request.tags)
+        create_request = request
+        if wants_git_memory:
+            filtered_tags = [t for t in (request.tags or []) if t != GIT_MEMORY_ENABLED_TAG]
+            updates: dict = {"tags": filtered_tags}
+
+            # Transform block labels to path-based for git-memory agents.
+            # Blocks without a "/" prefix go under system/ (rendered in system prompt).
+            # e.g. "human" -> "system/human", "persona" -> "system/persona"
+            # Blocks with an explicit path (e.g. "notes/project") keep their label.
+            if request.memory_blocks:
+                transformed_blocks = []
+                for block in request.memory_blocks:
+                    if not block.label.startswith("system/"):
+                        block = block.model_copy(update={"label": f"system/{block.label}"})
+                    transformed_blocks.append(block)
+                updates["memory_blocks"] = transformed_blocks
+
+            create_request = request.model_copy(update=updates)
 
         log_event(name="start create_agent db")
         main_agent = await self.agent_manager.create_agent_async(
-            agent_create=request,
+            agent_create=create_request,
             actor=actor,
         )
         log_event(name="end create_agent db")
+
+        # Enable git-backed memory (creates repo + commits initial blocks + adds tag)
+        if wants_git_memory and isinstance(self.block_manager, GitEnabledBlockManager):
+            await self.block_manager.enable_git_memory_for_agent(agent_id=main_agent.id, actor=actor)
+            # Preserve the user's requested tags and git_enabled flag in the response model.
+            try:
+                main_agent.tags = list(request.tags or [])
+                main_agent.memory.git_enabled = True
+            except Exception:
+                pass
+
+            # Recompile the system prompt now that git_enabled=True, so the
+            # persisted system message uses the git-style memory rendering
+            # instead of the legacy <memory_blocks> format.
+            await self.agent_manager.rebuild_system_prompt_async(agent_id=main_agent.id, actor=actor, force=True, update_timestamp=True)
 
         log_event(name="start insert_files_into_context_window db")
         # Use folder_ids if provided, otherwise fall back to deprecated source_ids for backwards compatibility
@@ -523,9 +672,12 @@ class SyncServer(object):
         request: UpdateAgent,
         actor: User,
     ) -> AgentState:
-        # Build llm_config from convenience fields if llm_config is not provided
+        # Build llm_config from convenience fields if llm_config is not provided.
+        # Use model_fields_set to distinguish "max_tokens omitted" from "max_tokens: null"
+        # so the client can explicitly clear a stale max_tokens on model switch.
+        max_tokens_explicitly_set = "max_tokens" in request.model_fields_set
         if request.llm_config is None and (
-            request.model is not None or request.context_window_limit is not None or request.max_tokens is not None
+            request.model is not None or request.context_window_limit is not None or max_tokens_explicitly_set
         ):
             if request.model is None:
                 agent = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
@@ -535,13 +687,31 @@ class SyncServer(object):
                 "context_window_limit": request.context_window_limit,
                 "max_tokens": request.max_tokens,
             }
-            log_event(name="start get_cached_llm_config", attributes=config_params)
-            request.llm_config = await self.get_cached_llm_config_async(actor=actor, **config_params)
-            log_event(name="end get_cached_llm_config", attributes=config_params)
+            log_event(name="start get_llm_config_from_handle", attributes=config_params)
+            request.llm_config = await self.get_llm_config_from_handle_async(actor=actor, **config_params)
+            log_event(name="end get_llm_config_from_handle", attributes=config_params)
+            # Explicitly clear max_tokens when the caller sent null (get_llm_config_from_handle
+            # skips null values, so we apply it here after the config is built).
+            if max_tokens_explicitly_set and request.max_tokens is None:
+                request.llm_config.max_tokens = None
 
         # update with model_settings
         if request.model_settings is not None:
+            if request.llm_config is None:
+                # Get the current agent's llm_config if not already set
+                agent = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+                request.llm_config = agent.llm_config.model_copy()
+            else:
+                # TODO: Refactor update_agent to accept partial llm_config so we
+                # don't need to fetch the full agent just to preserve max_tokens.
+                if not max_tokens_explicitly_set and "max_output_tokens" not in request.model_settings.model_fields_set:
+                    agent = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+                    request.llm_config.max_tokens = agent.llm_config.max_tokens
             update_llm_config_params = request.model_settings._to_legacy_config_params()
+            # Don't clobber max_tokens with the Pydantic default when the caller
+            # didn't explicitly provide max_output_tokens in the request.
+            if "max_output_tokens" not in request.model_settings.model_fields_set:
+                update_llm_config_params.pop("max_tokens", None)
             request.llm_config = request.llm_config.model_copy(update=update_llm_config_params)
 
         # Copy parallel_tool_calls from request to llm_config if provided
@@ -563,13 +733,30 @@ class SyncServer(object):
                 else:
                     await self.create_sleeptime_agent_async(main_agent=agent, actor=actor)
 
-        return await self.agent_manager.update_agent_async(
+        # If git-backed memory is requested via tag update, initialize/backfill the repo.
+        wants_git_memory = bool(request.tags and GIT_MEMORY_ENABLED_TAG in request.tags)
+
+        updated_agent = await self.agent_manager.update_agent_async(
             agent_id=agent_id,
             agent_update=request,
             actor=actor,
         )
 
-    async def create_sleeptime_agent_async(self, main_agent: AgentState, actor: User) -> AgentState:
+        # Ensure repo exists and initial blocks are committed when the tag is present.
+        if wants_git_memory and isinstance(self.block_manager, GitEnabledBlockManager):
+            await self.block_manager.enable_git_memory_for_agent(agent_id=agent_id, actor=actor)
+            # Preserve the user's requested tags in the response model.
+            try:
+                updated_agent.tags = list(request.tags or [])
+            except Exception:
+                pass
+
+        return updated_agent
+
+    async def create_sleeptime_agent_async(self, main_agent: AgentState, actor: User) -> Optional[AgentState]:
+        if main_agent.embedding_config is None:
+            logger.warning(f"Skipping sleeptime agent creation for agent {main_agent.id}: no embedding config provided")
+            return None
         request = CreateAgent(
             name=main_agent.name + "-sleeptime",
             agent_type=AgentType.sleeptime_agent,
@@ -601,7 +788,10 @@ class SyncServer(object):
         )
         return await self.agent_manager.get_agent_by_id_async(agent_id=main_agent.id, actor=actor)
 
-    async def create_voice_sleeptime_agent_async(self, main_agent: AgentState, actor: User) -> AgentState:
+    async def create_voice_sleeptime_agent_async(self, main_agent: AgentState, actor: User) -> Optional[AgentState]:
+        if main_agent.embedding_config is None:
+            logger.warning(f"Skipping voice sleeptime agent creation for agent {main_agent.id}: no embedding config provided")
+            return None
         # TODO: Inject system
         request = CreateAgent(
             name=main_agent.name + "-sleeptime",
@@ -666,19 +856,25 @@ class SyncServer(object):
     async def insert_archival_memory_async(
         self, agent_id: str, memory_contents: str, actor: User, tags: Optional[List[str]], created_at: Optional[datetime]
     ) -> List[Passage]:
+        from letta.services.context_window_calculator.token_counter import create_token_counter
         from letta.settings import settings
-        from letta.utils import count_tokens
+
+        # Get the agent object (loaded in memory)
+        agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
 
         # Check token count against limit
-        token_count = count_tokens(memory_contents)
+        token_counter = create_token_counter(
+            model_endpoint_type=agent_state.llm_config.model_endpoint_type,
+            model=agent_state.llm_config.model,
+            actor=actor,
+            agent_id=agent_id,
+        )
+        token_count = await token_counter.count_text_tokens(memory_contents)
         if token_count > settings.archival_memory_token_limit:
             raise LettaInvalidArgumentError(
                 message=f"Archival memory content exceeds token limit of {settings.archival_memory_token_limit} tokens (found {token_count} tokens)",
                 argument_name="memory_contents",
             )
-
-        # Get the agent object (loaded in memory)
-        agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
 
         # Use passage manager which handles dual-write to Turbopuffer if enabled
         passages = await self.passage_manager.insert_passage(
@@ -690,7 +886,7 @@ class SyncServer(object):
     async def delete_archival_memory_async(self, memory_id: str, actor: User):
         # TODO check if it exists first, and throw error if not
         # TODO: need to also rebuild the prompt here
-        passage = await self.passage_manager.get_passage_by_id_async(passage_id=memory_id, actor=actor)
+        await self.passage_manager.get_passage_by_id_async(passage_id=memory_id, actor=actor)
 
         # delete the passage
         await self.passage_manager.delete_passage_by_id_async(passage_id=memory_id, actor=actor)
@@ -751,6 +947,8 @@ class SyncServer(object):
         assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
         assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
         include_err: Optional[bool] = None,
+        conversation_id: Optional[str] = None,
+        include_return_message_types: Optional[List[MessageType]] = None,
     ) -> Union[List[Message], List[LettaMessage]]:
         records = await self.message_manager.list_messages(
             agent_id=agent_id,
@@ -761,6 +959,7 @@ class SyncServer(object):
             ascending=not reverse,
             group_id=group_id,
             include_err=include_err,
+            conversation_id=conversation_id,
         )
 
         if not return_message_object:
@@ -776,6 +975,7 @@ class SyncServer(object):
                 reverse=reverse,
                 include_err=include_err,
                 text_is_assistant_message=text_is_assistant_message,
+                include_return_message_types=include_return_message_types,
             )
 
         if reverse:
@@ -796,6 +996,8 @@ class SyncServer(object):
         assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
         assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
         include_err: Optional[bool] = None,
+        conversation_id: Optional[str] = None,
+        include_return_message_types: Optional[List[MessageType]] = None,
     ) -> Union[List[Message], List[LettaMessage]]:
         records = await self.message_manager.list_messages(
             agent_id=None,
@@ -806,6 +1008,7 @@ class SyncServer(object):
             ascending=not reverse,
             group_id=group_id,
             include_err=include_err,
+            conversation_id=conversation_id,
         )
 
         if not return_message_object:
@@ -821,6 +1024,7 @@ class SyncServer(object):
                 reverse=reverse,
                 include_err=include_err,
                 text_is_assistant_message=text_is_assistant_message,
+                include_return_message_types=include_return_message_types,
             )
 
         if reverse:
@@ -883,7 +1087,7 @@ class SyncServer(object):
         from letta.data_sources.connectors import DirectoryConnector
 
         # TODO: move this into a thread
-        source = await self.source_manager.get_source_by_id(source_id=source_id)
+        source = await self.source_manager.get_source_by_id(source_id=source_id, actor=actor)
         connector = DirectoryConnector(input_files=[file_path])
         num_passages, num_documents = await self.load_data(user_id=source.created_by_id, source_name=source.name, connector=connector)
 
@@ -968,10 +1172,13 @@ class SyncServer(object):
 
     async def create_document_sleeptime_agent_async(
         self, main_agent: AgentState, source: Source, actor: User, clear_history: bool = False
-    ) -> AgentState:
+    ) -> Optional[AgentState]:
+        if main_agent.embedding_config is None:
+            logger.warning(f"Skipping document sleeptime agent creation for agent {main_agent.id}: no embedding config provided")
+            return None
         try:
             block = await self.agent_manager.get_block_with_label_async(agent_id=main_agent.id, block_label=source.name, actor=actor)
-        except:
+        except Exception:
             block = await self.block_manager.create_or_update_block_async(Block(label=source.name, value=""), actor=actor)
             await self.agent_manager.attach_block_async(agent_id=main_agent.id, block_id=block.id, actor=actor)
 
@@ -1023,6 +1230,18 @@ class SyncServer(object):
         passage_count, document_count = await load_data(connector, source, self.passage_manager, self.file_manager, actor=actor)
         return passage_count, document_count
 
+    def _get_provider_sort_key(self, model: LLMConfig) -> Tuple[int, str, str]:
+        """Get sort key for a model: (provider_priority, provider_name, model_name)"""
+        provider_priority = constants.PROVIDER_ORDER.get(model.provider_name, 999)
+        return (provider_priority, model.provider_name or "", model.model or "")
+
+    def _get_embedding_provider_sort_key(self, model: EmbeddingConfig) -> Tuple[int, str, str]:
+        """Get sort key for an embedding model: (provider_priority, provider_name, model_name)"""
+        # Extract provider name from handle (format: "provider_name/model_name")
+        provider_name = model.handle.split("/")[0] if model.handle and "/" in model.handle else ""
+        provider_priority = constants.PROVIDER_ORDER.get(provider_name, 999)
+        return (provider_priority, provider_name, model.embedding_model or "")
+
     @trace_method
     async def list_llm_models_async(
         self,
@@ -1031,73 +1250,230 @@ class SyncServer(object):
         provider_name: Optional[str] = None,
         provider_type: Optional[ProviderType] = None,
     ) -> List[LLMConfig]:
-        """Asynchronously list available models with maximum concurrency"""
-        import asyncio
-
-        providers = await self.get_enabled_providers_async(
-            provider_category=provider_category,
-            provider_name=provider_name,
-            provider_type=provider_type,
-            actor=actor,
-        )
-
-        async def get_provider_models(provider: Provider) -> list[LLMConfig]:
-            try:
-                async with asyncio.timeout(constants.GET_PROVIDERS_TIMEOUT_SECONDS):
-                    return await provider.list_llm_models_async()
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout while listing LLM models for provider {provider}")
-                return []
-            except Exception as e:
-                logger.exception(f"Error while listing LLM models for provider {provider}: {e}")
-                return []
-
-        # Execute all provider model listing tasks concurrently
-        provider_results = await asyncio.gather(*[get_provider_models(provider) for provider in providers])
-
-        # Flatten the results
+        """List available LLM models - base from DB, BYOK from provider endpoints"""
         llm_models = []
-        for models in provider_results:
-            llm_models.extend(models)
 
-        # Get local configs - if this is potentially slow, consider making it async too
-        local_configs = self.get_local_llm_configs()
-        llm_models.extend(local_configs)
+        # Determine which categories to include
+        include_base = not provider_category or ProviderCategory.base in provider_category
+        include_byok = not provider_category or ProviderCategory.byok in provider_category
 
-        # dedupe by handle for uniqueness
-        # Seems like this is required from the tests?
-        seen_handles = set()
-        unique_models = []
-        for model in llm_models:
-            if model.handle not in seen_handles:
-                seen_handles.add(model.handle)
-                unique_models.append(model)
+        # Get base provider models from database
+        if include_base:
+            provider_models = await self.provider_manager.list_models_async(
+                actor=actor,
+                model_type="llm",
+                enabled=True,
+            )
 
-        return unique_models
+            # Build LLMConfig objects from database
+            from letta.services.provider_manager import AUTO_MODE_HANDLES
+
+            provider_cache: Dict[str, Provider] = {}
+            typed_provider_cache: Dict[str, Any] = {}
+            for model in provider_models:
+                # Handle synthetic auto mode models separately
+                if model.handle in AUTO_MODE_HANDLES:
+                    llm_config = LLMConfig(
+                        model=model.name,
+                        model_endpoint_type=model.model_endpoint_type,
+                        model_endpoint="",
+                        context_window=model.max_context_window or 180000,
+                        handle=model.handle,
+                        provider_name="letta",
+                        provider_category=ProviderCategory.base,
+                        max_tokens=8192,
+                    )
+                    llm_models.append(llm_config)
+                    continue
+
+                # Get provider details (with caching to avoid N+1 queries)
+                if model.provider_id not in provider_cache:
+                    provider_cache[model.provider_id] = await self.provider_manager.get_provider_async(model.provider_id, actor)
+                    typed_provider_cache[model.provider_id] = provider_cache[model.provider_id].cast_to_subtype()
+                provider = provider_cache[model.provider_id]
+                typed_provider = typed_provider_cache[model.provider_id]
+
+                # Skip non-base providers (they're handled separately)
+                if provider.provider_category != ProviderCategory.base:
+                    continue
+
+                # Apply provider_name/provider_type filters if specified
+                if provider_name and provider.name != provider_name:
+                    continue
+                if provider_type and provider.provider_type != provider_type:
+                    continue
+
+                # For bedrock, use schema default for base_url since DB may have NULL
+                # TODO: can maybe do this for all models but want to isolate change so we don't break any other providers
+                if provider.provider_type == ProviderType.bedrock:
+                    model_endpoint = typed_provider.base_url
+                else:
+                    model_endpoint = provider.base_url
+
+                # Get provider-specific default max_tokens
+                max_tokens = typed_provider.get_default_max_output_tokens(model.name)
+
+                llm_config = LLMConfig(
+                    model=model.name,
+                    model_endpoint_type=model.model_endpoint_type,
+                    model_endpoint=model_endpoint,
+                    context_window=model.max_context_window or 16384,
+                    handle=model.handle,
+                    provider_name=provider.name,
+                    provider_category=provider.provider_category,
+                    max_tokens=max_tokens,
+                )
+                llm_models.append(llm_config)
+
+        # Get BYOK provider models - sync if not synced yet, then read from DB
+        if include_byok:
+            byok_providers = await self.provider_manager.list_providers_async(
+                actor=actor,
+                name=provider_name,
+                provider_type=provider_type,
+                provider_category=[ProviderCategory.byok],
+            )
+
+            for provider in byok_providers:
+                try:
+                    # Get typed provider to access schema defaults (e.g., base_url)
+                    typed_provider = provider.cast_to_subtype()
+
+                    provider_llm_models = None
+                    should_sync_models = provider.last_synced is None
+
+                    # ChatGPT OAuth uses a hardcoded model list. If that list changes,
+                    # backfill already-synced providers that are missing new handles.
+                    if provider.provider_type == ProviderType.chatgpt_oauth and not should_sync_models:
+                        expected_models = await typed_provider.list_llm_models_async()
+                        expected_handles = {model.handle for model in expected_models}
+                        provider_llm_models = await self.provider_manager.list_models_async(
+                            actor=actor,
+                            model_type="llm",
+                            provider_id=provider.id,
+                            enabled=True,
+                        )
+                        existing_handles = {model.handle for model in provider_llm_models}
+                        should_sync_models = not expected_handles.issubset(existing_handles)
+
+                    if should_sync_models:
+                        models = await typed_provider.list_llm_models_async()
+                        embedding_models = await typed_provider.list_embedding_models_async()
+                        await self.provider_manager.sync_provider_models_async(
+                            provider=provider,
+                            llm_models=models,
+                            embedding_models=embedding_models,
+                            organization_id=provider.organization_id,
+                        )
+                        await self.provider_manager.update_provider_last_synced_async(provider.id, actor=actor)
+
+                    # Read from database
+                    if provider_llm_models is None:
+                        provider_llm_models = await self.provider_manager.list_models_async(
+                            actor=actor,
+                            model_type="llm",
+                            provider_id=provider.id,
+                            enabled=True,
+                        )
+                    for model in provider_llm_models:
+                        max_tokens = typed_provider.get_default_max_output_tokens(model.name)
+                        llm_config = LLMConfig(
+                            model=model.name,
+                            model_endpoint_type=model.model_endpoint_type,
+                            model_endpoint=typed_provider.base_url,
+                            context_window=model.max_context_window or constants.DEFAULT_CONTEXT_WINDOW,
+                            handle=model.handle,
+                            provider_name=provider.name,
+                            provider_category=ProviderCategory.byok,
+                            max_tokens=max_tokens,
+                        )
+                        llm_models.append(llm_config)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch models from BYOK provider {provider.name}: {e}")
+
+        # Sort by provider order (matching old _enabled_providers order), then by model name
+        llm_models.sort(key=self._get_provider_sort_key)
+
+        return llm_models
 
     async def list_embedding_models_async(self, actor: User) -> List[EmbeddingConfig]:
-        """Asynchronously list available embedding models with maximum concurrency"""
-        import asyncio
-
-        # Get all eligible providers first
-        providers = await self.get_enabled_providers_async(actor=actor)
-
-        # Fetch embedding models from each provider concurrently
-        async def get_provider_embedding_models(provider):
-            try:
-                # All providers now have list_embedding_models_async
-                return await provider.list_embedding_models_async()
-            except Exception as e:
-                logger.exception(f"An error occurred while listing embedding models for provider {provider}: {e}")
-                return []
-
-        # Execute all provider model listing tasks concurrently
-        provider_results = await asyncio.gather(*[get_provider_embedding_models(provider) for provider in providers])
-
-        # Flatten the results
+        """List available embedding models - base from DB, BYOK from provider endpoints"""
         embedding_models = []
-        for models in provider_results:
-            embedding_models.extend(models)
+
+        # Get base provider models from database
+        provider_models = await self.provider_manager.list_models_async(
+            actor=actor,
+            model_type="embedding",
+            enabled=True,
+        )
+
+        # Build EmbeddingConfig objects from database (base providers only)
+        provider_cache: Dict[str, Provider] = {}
+        for model in provider_models:
+            # Get provider details (with caching to avoid N+1 queries)
+            if model.provider_id not in provider_cache:
+                provider_cache[model.provider_id] = await self.provider_manager.get_provider_async(model.provider_id, actor)
+            provider = provider_cache[model.provider_id]
+
+            # Skip non-base providers (they're handled separately)
+            if provider.provider_category != ProviderCategory.base:
+                continue
+
+            embedding_config = EmbeddingConfig(
+                embedding_model=model.name,
+                embedding_endpoint_type=model.model_endpoint_type,
+                embedding_endpoint=provider.base_url or model.model_endpoint_type,
+                embedding_dim=model.embedding_dim or 1536,
+                embedding_chunk_size=constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
+                handle=model.handle,
+            )
+            embedding_models.append(embedding_config)
+
+        # Get BYOK provider models - sync if not synced yet, then read from DB
+        byok_providers = await self.provider_manager.list_providers_async(
+            actor=actor,
+            provider_category=[ProviderCategory.byok],
+        )
+
+        for provider in byok_providers:
+            try:
+                # Get typed provider to access schema defaults (e.g., base_url)
+                typed_provider = provider.cast_to_subtype()
+
+                # Sync models if not synced yet
+                if provider.last_synced is None:
+                    llm_models = await typed_provider.list_llm_models_async()
+                    emb_models = await typed_provider.list_embedding_models_async()
+                    await self.provider_manager.sync_provider_models_async(
+                        provider=provider,
+                        llm_models=llm_models,
+                        embedding_models=emb_models,
+                        organization_id=provider.organization_id,
+                    )
+                    await self.provider_manager.update_provider_last_synced_async(provider.id, actor=actor)
+
+                # Read from database
+                provider_embedding_models = await self.provider_manager.list_models_async(
+                    actor=actor,
+                    model_type="embedding",
+                    provider_id=provider.id,
+                    enabled=True,
+                )
+                for model in provider_embedding_models:
+                    embedding_config = EmbeddingConfig(
+                        embedding_model=model.name,
+                        embedding_endpoint_type=model.model_endpoint_type,
+                        embedding_endpoint=typed_provider.base_url,
+                        embedding_dim=model.embedding_dim or 1536,
+                        embedding_chunk_size=constants.DEFAULT_EMBEDDING_CHUNK_SIZE,
+                        handle=model.handle,
+                    )
+                    embedding_models.append(embedding_config)
+            except Exception as e:
+                logger.warning(f"Failed to fetch embedding models from BYOK provider {provider.name}: {e}")
+
+        # Sort by provider order (matching old _enabled_providers order), then by model name
+        embedding_models.sort(key=self._get_embedding_provider_sort_key)
 
         return embedding_models
 
@@ -1108,25 +1484,17 @@ class SyncServer(object):
         provider_name: Optional[str] = None,
         provider_type: Optional[ProviderType] = None,
     ) -> List[Provider]:
-        providers = []
-        if not provider_category or ProviderCategory.base in provider_category:
-            providers_from_env = [p for p in self._enabled_providers]
-            providers.extend(providers_from_env)
+        # Query all persisted providers from database
+        persisted_providers = await self.provider_manager.list_providers_async(
+            name=provider_name,
+            provider_type=provider_type,
+            actor=actor,
+        )
+        providers = [p.cast_to_subtype() for p in persisted_providers]
 
-        if not provider_category or ProviderCategory.byok in provider_category:
-            providers_from_db = await self.provider_manager.list_providers_async(
-                name=provider_name,
-                provider_type=provider_type,
-                actor=actor,
-            )
-            providers_from_db = [p.cast_to_subtype() for p in providers_from_db]
-            providers.extend(providers_from_db)
-
-        if provider_name is not None:
-            providers = [p for p in providers if p.name == provider_name]
-
-        if provider_type is not None:
-            providers = [p for p in providers if p.provider_type == provider_type]
+        # Filter by category if specified
+        if provider_category:
+            providers = [p for p in providers if p.provider_category in provider_category]
 
         return providers
 
@@ -1140,39 +1508,26 @@ class SyncServer(object):
         max_reasoning_tokens: Optional[int] = None,
         enable_reasoner: Optional[bool] = None,
     ) -> LLMConfig:
+        # Use provider_manager to get LLMConfig from handle
         try:
-            provider_name, model_name = handle.split("/", 1)
-            provider = await self.get_provider_from_name_async(provider_name, actor)
-
-            all_llm_configs = await provider.list_llm_models_async()
-            llm_configs = [config for config in all_llm_configs if config.handle == handle]
-            if not llm_configs:
-                llm_configs = [config for config in all_llm_configs if config.model == model_name]
-            if not llm_configs:
-                available_handles = [config.handle for config in all_llm_configs]
-                raise HandleNotFoundError(handle, available_handles)
-        except ValueError as e:
-            llm_configs = [config for config in self.get_local_llm_configs() if config.handle == handle]
-            if not llm_configs:
-                llm_configs = [config for config in self.get_local_llm_configs() if config.model == model_name]
-            if not llm_configs:
-                raise e
-
-        if len(llm_configs) == 1:
-            llm_config = llm_configs[0]
-        elif len(llm_configs) > 1:
-            raise LettaInvalidArgumentError(
-                f"Multiple LLM models with name {model_name} supported by {provider_name}", argument_name="model_name"
+            llm_config = await self.provider_manager.get_llm_config_from_handle(
+                handle=handle,
+                actor=actor,
             )
-        else:
-            llm_config = llm_configs[0]
+        except Exception as e:
+            # Convert to HandleNotFoundError for backwards compatibility
+            from letta.orm.errors import NoResultFound
+
+            if isinstance(e, NoResultFound):
+                raise HandleNotFoundError(handle, [])
+            raise
 
         if context_window_limit is not None:
-            if context_window_limit > llm_config.context_window:
-                raise LettaInvalidArgumentError(
-                    f"Context window limit ({context_window_limit}) is greater than maximum of ({llm_config.context_window})",
-                    argument_name="context_window_limit",
-                )
+            # if context_window_limit > llm_config.context_window:
+            #     raise LettaInvalidArgumentError(
+            #         f"Context window limit ({context_window_limit}) is greater than maximum of ({llm_config.context_window})",
+            #         argument_name="context_window_limit",
+            #     )
             llm_config.context_window = context_window_limit
         else:
             llm_config.context_window = min(llm_config.context_window, model_settings.global_max_context_window_limit)
@@ -1197,33 +1552,22 @@ class SyncServer(object):
     async def get_embedding_config_from_handle_async(
         self, actor: User, handle: str, embedding_chunk_size: int = constants.DEFAULT_EMBEDDING_CHUNK_SIZE
     ) -> EmbeddingConfig:
+        # Use provider_manager to get EmbeddingConfig from handle
         try:
-            provider_name, model_name = handle.split("/", 1)
-            provider = await self.get_provider_from_name_async(provider_name, actor)
-
-            all_embedding_configs = await provider.list_embedding_models_async()
-            embedding_configs = [config for config in all_embedding_configs if config.handle == handle]
-            if not embedding_configs:
-                raise LettaInvalidArgumentError(
-                    f"Embedding model {model_name} is not supported by {provider_name}", argument_name="model_name"
-                )
-        except LettaInvalidArgumentError as e:
-            # search local configs
-            embedding_configs = [config for config in self.get_local_embedding_configs() if config.handle == handle]
-            if not embedding_configs:
-                raise e
-
-        if len(embedding_configs) == 1:
-            embedding_config = embedding_configs[0]
-        elif len(embedding_configs) > 1:
-            raise LettaInvalidArgumentError(
-                f"Multiple embedding models with name {model_name} supported by {provider_name}", argument_name="model_name"
+            embedding_config = await self.provider_manager.get_embedding_config_from_handle(
+                handle=handle,
+                actor=actor,
             )
-        else:
-            embedding_config = embedding_configs[0]
+        except Exception as e:
+            # Convert to LettaInvalidArgumentError for backwards compatibility
+            from letta.orm.errors import NoResultFound
 
-        if embedding_chunk_size:
-            embedding_config.embedding_chunk_size = embedding_chunk_size
+            if isinstance(e, NoResultFound):
+                raise LettaInvalidArgumentError(f"Embedding model {handle} not found", argument_name="handle")
+            raise
+
+        # Override chunk size if provided
+        embedding_config.embedding_chunk_size = embedding_chunk_size
 
         return embedding_config
 
@@ -1232,55 +1576,16 @@ class SyncServer(object):
         providers = [provider for provider in all_providers if provider.name == provider_name]
         if not providers:
             raise LettaInvalidArgumentError(
-                f"Provider {provider_name} is not supported (supported providers: {', '.join([provider.name for provider in self._enabled_providers])})",
+                f"Provider {provider_name} is not supported (supported providers: {', '.join([provider.name for provider in all_providers])})",
                 argument_name="provider_name",
             )
         elif len(providers) > 1:
-            raise LettaInvalidArgumentError(f"Multiple providers with name {provider_name} supported", argument_name="provider_name")
+            logger.warning(f"Multiple providers with name {provider_name} supported")
+            provider = providers[0]
         else:
             provider = providers[0]
 
         return provider
-
-    def get_local_llm_configs(self):
-        llm_models = []
-        # NOTE: deprecated
-        # try:
-        #    llm_configs_dir = os.path.expanduser("~/.letta/llm_configs")
-        #    if os.path.exists(llm_configs_dir):
-        #        for filename in os.listdir(llm_configs_dir):
-        #            if filename.endswith(".json"):
-        #                filepath = os.path.join(llm_configs_dir, filename)
-        #                try:
-        #                    with open(filepath, "r") as f:
-        #                        config_data = json.load(f)
-        #                        llm_config = LLMConfig(**config_data)
-        #                        llm_models.append(llm_config)
-        #                except (json.JSONDecodeError, ValueError) as e:
-        #                    logger.warning(f"Error parsing LLM config file {filename}: {e}")
-        # except Exception as e:
-        #    logger.warning(f"Error reading LLM configs directory: {e}")
-        return llm_models
-
-    def get_local_embedding_configs(self):
-        embedding_models = []
-        # NOTE: deprecated
-        # try:
-        #    embedding_configs_dir = os.path.expanduser("~/.letta/embedding_configs")
-        #    if os.path.exists(embedding_configs_dir):
-        #        for filename in os.listdir(embedding_configs_dir):
-        #            if filename.endswith(".json"):
-        #                filepath = os.path.join(embedding_configs_dir, filename)
-        #                try:
-        #                    with open(filepath, "r") as f:
-        #                        config_data = json.load(f)
-        #                        embedding_config = EmbeddingConfig(**config_data)
-        #                        embedding_models.append(embedding_config)
-        #                except (json.JSONDecodeError, ValueError) as e:
-        #                    logger.warning(f"Error parsing embedding config file {filename}: {e}")
-        # except Exception as e:
-        #    logger.warning(f"Error reading embedding configs directory: {e}")
-        return embedding_models
 
     def add_llm_model(self, request: LLMConfig) -> LLMConfig:
         """Add a new LLM model"""
@@ -1302,7 +1607,7 @@ class SyncServer(object):
     ) -> ToolReturnMessage:
         """Run a tool from source code"""
 
-        from letta.services.tool_schema_generator import generate_schema_for_tool_creation, generate_schema_for_tool_update
+        from letta.services.tool_schema_generator import generate_schema_for_tool_creation
 
         if tool_source_type not in (None, ToolSourceType.python, ToolSourceType.typescript):
             raise LettaInvalidArgumentError(
@@ -1371,6 +1676,7 @@ class SyncServer(object):
                 id="null",
                 tool_call_id="null",
                 date=get_utc_time(),
+                name=tool_name,
                 status=tool_execution_result.status,
                 tool_return=str(tool_execution_result.func_return),
                 stdout=tool_execution_result.stdout,
@@ -1394,6 +1700,7 @@ class SyncServer(object):
                 id="null",
                 tool_call_id="null",
                 date=get_utc_time(),
+                name=tool.name,
                 status="error",
                 tool_return=func_return,
                 stdout=[],
@@ -1510,16 +1817,21 @@ class SyncServer(object):
 
         # Attempt to initialize the connection to the server
         if server_config.type == MCPServerType.SSE:
-            new_mcp_client = AsyncSSEMCPClient(server_config)
+            new_mcp_client = AsyncFastMCPSSEClient(server_config)
         elif server_config.type == MCPServerType.STDIO:
             new_mcp_client = AsyncStdioMCPClient(server_config)
         else:
             raise LettaInvalidArgumentError(f"Invalid MCP server config: {server_config}", argument_name="server_config")
         try:
             await new_mcp_client.connect_to_server()
-        except:
+        except LettaMCPConnectionError:
+            raise
+        except Exception:
             logger.exception(f"Failed to connect to MCP server: {server_config.server_name}")
-            raise RuntimeError(f"Failed to connect to MCP server: {server_config.server_name}")
+            raise LettaMCPConnectionError(
+                message=f"Failed to connect to MCP server: {server_config.server_name}",
+                server_name=server_config.server_name,
+            )
         # Print out the tools that are connected
         logger.info(f"Attempting to fetch tools from MCP server: {server_config.server_name}")
         new_mcp_tools = await new_mcp_client.list_tools()
@@ -1590,244 +1902,3 @@ class SyncServer(object):
             raise LettaInvalidArgumentError(f"Failed to write MCP config file {mcp_config_path}")
 
         return list(current_mcp_servers.values())
-
-    @trace_method
-    async def send_message_to_agent(
-        self,
-        agent_id: str,
-        actor: User,
-        # role: MessageRole,
-        input_messages: List[MessageCreate],
-        stream_steps: bool,
-        stream_tokens: bool,
-        # related to whether or not we return `LettaMessage`s or `Message`s
-        chat_completion_mode: bool = False,
-        # Support for AssistantMessage
-        use_assistant_message: bool = True,
-        assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
-        assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
-        metadata: Optional[dict] = None,
-        request_start_timestamp_ns: Optional[int] = None,
-        include_return_message_types: Optional[List[MessageType]] = None,
-    ) -> Union[StreamingResponse, LettaResponse]:
-        """Split off into a separate function so that it can be imported in the /chat/completion proxy."""
-        # TODO: @charles is this the correct way to handle?
-        include_final_message = True
-
-        if not stream_steps and stream_tokens:
-            raise HTTPException(status_code=400, detail="stream_steps must be 'true' if stream_tokens is 'true'")
-
-        # For streaming response
-        try:
-            # TODO: move this logic into server.py
-
-            # Get the generator object off of the agent's streaming interface
-            # This will be attached to the POST SSE request used under-the-hood
-            letta_agent = self.load_agent(agent_id=agent_id, actor=actor)
-
-            # Disable token streaming if not OpenAI or Anthropic
-            # TODO: cleanup this logic
-            llm_config = letta_agent.agent_state.llm_config
-            # supports_token_streaming = ["openai", "anthropic", "xai", "deepseek"]
-            supports_token_streaming = ["openai", "anthropic", "deepseek"]  # TODO re-enable xAI once streaming is patched
-            if stream_tokens and (llm_config.model_endpoint_type not in supports_token_streaming):
-                logger.warning(
-                    f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
-                )
-                stream_tokens = False
-
-            # Create a new interface per request
-            letta_agent.interface = StreamingServerInterface(
-                # multi_step=True,  # would we ever want to disable this?
-                use_assistant_message=use_assistant_message,
-                assistant_message_tool_name=assistant_message_tool_name,
-                assistant_message_tool_kwarg=assistant_message_tool_kwarg,
-                inner_thoughts_in_kwargs=(
-                    llm_config.put_inner_thoughts_in_kwargs if llm_config.put_inner_thoughts_in_kwargs is not None else False
-                ),
-                # inner_thoughts_kwarg=INNER_THOUGHTS_KWARG,
-            )
-            streaming_interface = letta_agent.interface
-            if not isinstance(streaming_interface, StreamingServerInterface):
-                raise LettaInvalidArgumentError(
-                    f"Agent has wrong type of interface: {type(streaming_interface)}", argument_name="interface"
-                )
-
-            # Enable token-streaming within the request if desired
-            streaming_interface.streaming_mode = stream_tokens
-            # "chatcompletion mode" does some remapping and ignores inner thoughts
-            streaming_interface.streaming_chat_completion_mode = chat_completion_mode
-
-            # streaming_interface.allow_assistant_message = stream
-            # streaming_interface.function_call_legacy_mode = stream
-
-            # Allow AssistantMessage is desired by client
-            # streaming_interface.use_assistant_message = use_assistant_message
-            # streaming_interface.assistant_message_tool_name = assistant_message_tool_name
-            # streaming_interface.assistant_message_tool_kwarg = assistant_message_tool_kwarg
-
-            # Related to JSON buffer reader
-            # streaming_interface.inner_thoughts_in_kwargs = (
-            #     llm_config.put_inner_thoughts_in_kwargs if llm_config.put_inner_thoughts_in_kwargs is not None else False
-            # )
-
-            # Offload the synchronous message_func to a separate thread
-            streaming_interface.stream_start()
-            task = safe_create_task(
-                asyncio.to_thread(
-                    self.send_messages,
-                    actor=actor,
-                    agent_id=agent_id,
-                    input_messages=input_messages,
-                    interface=streaming_interface,
-                    metadata=metadata,
-                ),
-                label="send_messages_thread",
-            )
-
-            if stream_steps:
-                # return a stream
-                return StreamingResponse(
-                    sse_async_generator(
-                        streaming_interface.get_generator(),
-                        usage_task=task,
-                        finish_message=include_final_message,
-                        request_start_timestamp_ns=request_start_timestamp_ns,
-                        llm_config=llm_config,
-                    ),
-                    media_type="text/event-stream",
-                )
-
-            else:
-                # buffer the stream, then return the list
-                generated_stream = []
-                async for message in streaming_interface.get_generator():
-                    assert (
-                        isinstance(message, LettaMessage)
-                        or isinstance(message, LegacyLettaMessage)
-                        or isinstance(message, MessageStreamStatus)
-                    ), type(message)
-                    generated_stream.append(message)
-                    if message == MessageStreamStatus.done:
-                        break
-
-                # Get rid of the stream status messages
-                filtered_stream = [d for d in generated_stream if not isinstance(d, MessageStreamStatus)]
-
-                # Apply message type filtering if specified
-                if include_return_message_types is not None:
-                    filtered_stream = [msg for msg in filtered_stream if msg.message_type in include_return_message_types]
-
-                usage = await task
-
-                # By default the stream will be messages of type LettaMessage or LettaLegacyMessage
-                # If we want to convert these to Message, we can use the attached IDs
-                # NOTE: we will need to de-duplicate the Messsage IDs though (since Assistant->Inner+Func_Call)
-                # TODO: eventually update the interface to use `Message` and `MessageChunk` (new) inside the deque instead
-                return LettaResponse(
-                    messages=filtered_stream,
-                    stop_reason=LettaStopReason(stop_reason=StopReasonType.end_turn.value),
-                    usage=usage,
-                )
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception(f"Error sending message to agent: {e}")
-            raise HTTPException(status_code=500, detail=f"{e}")
-
-    @trace_method
-    async def send_group_message_to_agent(
-        self,
-        group_id: str,
-        actor: User,
-        input_messages: Union[List[Message], List[MessageCreate]],
-        stream_steps: bool,
-        stream_tokens: bool,
-        chat_completion_mode: bool = False,
-        # Support for AssistantMessage
-        use_assistant_message: bool = True,
-        assistant_message_tool_name: str = constants.DEFAULT_MESSAGE_TOOL,
-        assistant_message_tool_kwarg: str = constants.DEFAULT_MESSAGE_TOOL_KWARG,
-        metadata: Optional[dict] = None,
-    ) -> Union[StreamingResponse, LettaResponse]:
-        include_final_message = True
-        if not stream_steps and stream_tokens:
-            raise LettaInvalidArgumentError("stream_steps must be 'true' if stream_tokens is 'true'", argument_name="stream_steps")
-
-        group = await self.group_manager.retrieve_group_async(group_id=group_id, actor=actor)
-        agent_state_id = group.manager_agent_id or (group.agent_ids[0] if len(group.agent_ids) > 0 else None)
-        agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=agent_state_id, actor=actor) if agent_state_id else None
-        letta_multi_agent = load_multi_agent(group=group, agent_state=agent_state, actor=actor)
-
-        llm_config = letta_multi_agent.agent_state.llm_config
-        supports_token_streaming = ["openai", "anthropic", "deepseek"]
-        if stream_tokens and (llm_config.model_endpoint_type not in supports_token_streaming):
-            logger.warning(
-                f"Token streaming is only supported for models with type {' or '.join(supports_token_streaming)} in the model_endpoint: agent has endpoint type {llm_config.model_endpoint_type} and {llm_config.model_endpoint}. Setting stream_tokens to False."
-            )
-            stream_tokens = False
-
-        # Create a new interface per request
-        letta_multi_agent.interface = StreamingServerInterface(
-            use_assistant_message=use_assistant_message,
-            assistant_message_tool_name=assistant_message_tool_name,
-            assistant_message_tool_kwarg=assistant_message_tool_kwarg,
-            inner_thoughts_in_kwargs=(
-                llm_config.put_inner_thoughts_in_kwargs if llm_config.put_inner_thoughts_in_kwargs is not None else False
-            ),
-        )
-        streaming_interface = letta_multi_agent.interface
-        if not isinstance(streaming_interface, StreamingServerInterface):
-            raise LettaInvalidArgumentError(f"Agent has wrong type of interface: {type(streaming_interface)}", argument_name="interface")
-        streaming_interface.streaming_mode = stream_tokens
-        streaming_interface.streaming_chat_completion_mode = chat_completion_mode
-        if metadata and hasattr(streaming_interface, "metadata"):
-            streaming_interface.metadata = metadata
-
-        streaming_interface.stream_start()
-        task = safe_create_task(
-            asyncio.to_thread(
-                letta_multi_agent.step,
-                input_messages=input_messages,
-                chaining=self.chaining,
-                max_chaining_steps=self.max_chaining_steps,
-            ),
-            label="multi_agent_step_thread",
-        )
-
-        if stream_steps:
-            # return a stream
-            return StreamingResponse(
-                sse_async_generator(
-                    streaming_interface.get_generator(),
-                    usage_task=task,
-                    finish_message=include_final_message,
-                ),
-                media_type="text/event-stream",
-            )
-
-        else:
-            # buffer the stream, then return the list
-            generated_stream = []
-            async for message in streaming_interface.get_generator():
-                assert (
-                    isinstance(message, LettaMessage) or isinstance(message, LegacyLettaMessage) or isinstance(message, MessageStreamStatus)
-                ), type(message)
-                generated_stream.append(message)
-                if message == MessageStreamStatus.done:
-                    break
-
-            # Get rid of the stream status messages
-            filtered_stream = [d for d in generated_stream if not isinstance(d, MessageStreamStatus)]
-            usage = await task
-
-            # By default the stream will be messages of type LettaMessage or LettaLegacyMessage
-            # If we want to convert these to Message, we can use the attached IDs
-            # NOTE: we will need to de-duplicate the Messsage IDs though (since Assistant->Inner+Func_Call)
-            # TODO: eventually update the interface to use `Message` and `MessageChunk` (new) inside the deque instead
-            return LettaResponse(
-                messages=filtered_stream,
-                stop_reason=LettaStopReason(stop_reason=StopReasonType.end_turn.value),
-                usage=usage,
-            )

@@ -3,7 +3,13 @@ import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from opentelemetry.trace import Span
+
+    from letta.schemas.llm_config import LLMConfig
+    from letta.schemas.usage import LettaUsageStatistics
 
 from anthropic import AsyncStream
 from anthropic.types.beta import (
@@ -39,6 +45,7 @@ from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import FunctionCall, ToolCall
 from letta.server.rest_api.json_parser import JSONParser, PydanticJSONParser
+from letta.server.rest_api.streaming_response import RunCancelledException
 from letta.server.rest_api.utils import decrement_message_uuid
 
 logger = get_logger(__name__)
@@ -73,10 +80,12 @@ class SimpleAnthropicStreamingInterface:
         requires_approval_tools: list = [],
         run_id: str | None = None,
         step_id: str | None = None,
+        llm_config: "LLMConfig | None" = None,
     ):
         self.json_parser: JSONParser = PydanticJSONParser()
         self.run_id = run_id
         self.step_id = step_id
+        self.llm_config = llm_config
 
         # Premake IDs for database writes
         self.letta_message_id = Message.generate_id()
@@ -88,11 +97,19 @@ class SimpleAnthropicStreamingInterface:
         self.tool_call_name = None
         self.accumulated_tool_call_args = ""
         self.previous_parse = {}
+        self.thinking_signature = None
 
         # usage trackers
         self.input_tokens = 0
         self.output_tokens = 0
         self.model = None
+
+        # cache tracking (Anthropic-specific)
+        self.cache_read_tokens = 0
+        self.cache_creation_tokens = 0
+
+        # Raw usage from provider (for transparent logging in provider trace)
+        self.raw_usage: dict | None = None
 
         # reasoning object trackers
         self.reasoning_messages = []
@@ -136,6 +153,26 @@ class SimpleAnthropicStreamingInterface:
         if tool_calls:
             return tool_calls[0]
         return None
+
+    def get_usage_statistics(self) -> "LettaUsageStatistics":
+        """Extract usage statistics from accumulated streaming data.
+
+        Returns:
+            LettaUsageStatistics with token counts from the stream.
+        """
+        from letta.schemas.usage import LettaUsageStatistics
+
+        # Anthropic: input_tokens is NON-cached only, must add cache tokens for total
+        actual_input_tokens = (self.input_tokens or 0) + (self.cache_read_tokens or 0) + (self.cache_creation_tokens or 0)
+
+        return LettaUsageStatistics(
+            prompt_tokens=actual_input_tokens,
+            completion_tokens=self.output_tokens or 0,
+            total_tokens=actual_input_tokens + (self.output_tokens or 0),
+            cached_input_tokens=self.cache_read_tokens if self.cache_read_tokens else None,
+            cache_write_tokens=self.cache_creation_tokens if self.cache_creation_tokens else None,
+            reasoning_tokens=None,  # Anthropic doesn't report reasoning tokens separately
+        )
 
     def get_reasoning_content(self) -> list[TextContent | ReasoningContent | RedactedReasoningContent]:
         def _process_group(
@@ -220,10 +257,10 @@ class SimpleAnthropicStreamingInterface:
                                 prev_message_type = new_message_type
                             # print(f"Yielding message: {message}")
                             yield message
-                    except asyncio.CancelledError as e:
+                    except (asyncio.CancelledError, RunCancelledException) as e:
                         import traceback
 
-                        logger.info("Cancelled stream attempt but overriding %s: %s", e, traceback.format_exc())
+                        logger.info("Cancelled stream attempt but overriding (%s) %s: %s", type(e).__name__, e, traceback.format_exc())
                         async for message in self._process_event(event, ttft_span, prev_message_type, message_index):
                             new_message_type = message.message_type
                             if new_message_type != prev_message_type:
@@ -245,7 +282,13 @@ class SimpleAnthropicStreamingInterface:
                     attributes={"stop_reason": StopReasonType.error.value, "error": str(e), "stacktrace": traceback.format_exc()},
                 )
             yield LettaStopReason(stop_reason=StopReasonType.error)
-            raise e
+
+            # Transform Anthropic errors into our custom error types for consistent handling
+            from letta.llm_api.anthropic_client import AnthropicClient
+
+            client = AnthropicClient()
+            transformed_error = client.handle_llm_error(e, llm_config=self.llm_config)
+            raise transformed_error
         finally:
             logger.info("AnthropicStreamingInterface: Stream processing complete.")
 
@@ -287,6 +330,7 @@ class SimpleAnthropicStreamingInterface:
                         id=decrement_message_uuid(self.letta_message_id),
                         # Do not emit placeholder arguments here to avoid UI duplicates
                         tool_call=ToolCallDelta(name=name, tool_call_id=call_id),
+                        tool_calls=ToolCallDelta(name=name, tool_call_id=call_id),
                         date=datetime.now(timezone.utc).isoformat(),
                         otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                         run_id=self.run_id,
@@ -392,6 +436,7 @@ class SimpleAnthropicStreamingInterface:
                     tool_call_msg = ApprovalRequestMessage(
                         id=decrement_message_uuid(self.letta_message_id),
                         tool_call=ToolCallDelta(name=name, tool_call_id=call_id, arguments=delta.partial_json),
+                        tool_calls=ToolCallDelta(name=name, tool_call_id=call_id, arguments=delta.partial_json),
                         date=datetime.now(timezone.utc).isoformat(),
                         otid=Message.generate_otid_from_id(decrement_message_uuid(self.letta_message_id), -1),
                         run_id=self.run_id,
@@ -419,20 +464,23 @@ class SimpleAnthropicStreamingInterface:
                         f"Streaming integrity failed - received BetaThinkingBlock object while not in THINKING EventMode: {delta}"
                     )
 
-                if prev_message_type and prev_message_type != "reasoning_message":
-                    message_index += 1
-                reasoning_message = ReasoningMessage(
-                    id=self.letta_message_id,
-                    source="reasoner_model",
-                    reasoning=delta.thinking,
-                    date=datetime.now(timezone.utc).isoformat(),
-                    otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
-                    run_id=self.run_id,
-                    step_id=self.step_id,
-                )
-                self.reasoning_messages.append(reasoning_message)
-                prev_message_type = reasoning_message.message_type
-                yield reasoning_message
+                # Only emit reasoning message if we have actual content
+                if delta.thinking and delta.thinking.strip():
+                    if prev_message_type and prev_message_type != "reasoning_message":
+                        message_index += 1
+                    reasoning_message = ReasoningMessage(
+                        id=self.letta_message_id,
+                        source="reasoner_model",
+                        reasoning=delta.thinking,
+                        signature=self.thinking_signature,
+                        date=datetime.now(timezone.utc).isoformat(),
+                        otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
+                        run_id=self.run_id,
+                        step_id=self.step_id,
+                    )
+                    self.reasoning_messages.append(reasoning_message)
+                    prev_message_type = reasoning_message.message_type
+                    yield reasoning_message
 
             elif isinstance(delta, BetaSignatureDelta):
                 # Safety check
@@ -441,21 +489,15 @@ class SimpleAnthropicStreamingInterface:
                         f"Streaming integrity failed - received BetaSignatureDelta object while not in THINKING EventMode: {delta}"
                     )
 
-                if prev_message_type and prev_message_type != "reasoning_message":
-                    message_index += 1
-                reasoning_message = ReasoningMessage(
-                    id=self.letta_message_id,
-                    source="reasoner_model",
-                    reasoning="",
-                    date=datetime.now(timezone.utc).isoformat(),
-                    signature=delta.signature,
-                    otid=Message.generate_otid_from_id(self.letta_message_id, message_index),
-                    run_id=self.run_id,
-                    step_id=self.step_id,
-                )
-                self.reasoning_messages.append(reasoning_message)
-                prev_message_type = reasoning_message.message_type
-                yield reasoning_message
+                # Store signature but don't emit empty reasoning message
+                # Signature will be attached when actual thinking content arrives
+                self.thinking_signature = delta.signature
+
+                # Update the last reasoning message with the signature so it gets persisted
+                if self.reasoning_messages:
+                    last_msg = self.reasoning_messages[-1]
+                    if isinstance(last_msg, ReasoningMessage):
+                        last_msg.signature = delta.signature
 
         elif isinstance(event, BetaRawMessageStartEvent):
             self.message_id = event.message.id
@@ -463,12 +505,34 @@ class SimpleAnthropicStreamingInterface:
             self.output_tokens += event.message.usage.output_tokens
             self.model = event.message.model
 
+            # Capture cache data if available
+            usage = event.message.usage
+            if hasattr(usage, "cache_read_input_tokens") and usage.cache_read_input_tokens:
+                self.cache_read_tokens += usage.cache_read_input_tokens
+            if hasattr(usage, "cache_creation_input_tokens") and usage.cache_creation_input_tokens:
+                self.cache_creation_tokens += usage.cache_creation_input_tokens
+
+            # Store raw usage for transparent provider trace logging
+            try:
+                self.raw_usage = usage.model_dump(exclude_none=True)
+            except Exception as e:
+                logger.error(f"Failed to capture raw_usage from Anthropic: {e}")
+                self.raw_usage = None
+
         elif isinstance(event, BetaRawMessageDeltaEvent):
-            self.output_tokens += event.usage.output_tokens
+            # Per Anthropic docs: "The token counts shown in the usage field of the
+            # message_delta event are *cumulative*." So we assign, not accumulate.
+            self.output_tokens = event.usage.output_tokens
 
         elif isinstance(event, BetaRawMessageStopEvent):
-            # Don't do anything here! We don't want to stop the stream.
-            pass
+            # Update raw_usage with final accumulated values for accurate provider trace logging
+            if self.raw_usage:
+                self.raw_usage["input_tokens"] = self.input_tokens
+                self.raw_usage["output_tokens"] = self.output_tokens
+                if self.cache_read_tokens:
+                    self.raw_usage["cache_read_input_tokens"] = self.cache_read_tokens
+                if self.cache_creation_tokens:
+                    self.raw_usage["cache_creation_input_tokens"] = self.cache_creation_tokens
 
         elif isinstance(event, BetaRawContentBlockStopEvent):
             # Finalize the tool_use block at this index using accumulated deltas

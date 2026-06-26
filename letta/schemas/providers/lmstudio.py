@@ -61,6 +61,7 @@ class LMStudioOpenAIProvider(OpenAIProvider):
                     model_endpoint=self.model_endpoint_url,
                     context_window=context_window_size,
                     handle=self.get_handle(model_name),
+                    max_tokens=self.get_default_max_output_tokens(model_name),
                     compatibility_type=compatibility_type,
                     provider_name=self.name,
                     provider_category=self.provider_category,
@@ -91,7 +92,7 @@ class LMStudioOpenAIProvider(OpenAIProvider):
             check = self._do_model_checks_for_name_and_context_size(model, length_key="max_context_length")
             if check is None:
                 continue
-            model_name, context_window_size = check
+            model_name, _context_window_size = check
 
             configs.append(
                 EmbeddingConfig(

@@ -8,6 +8,27 @@ LETTA_TOOL_EXECUTION_DIR = os.path.join(LETTA_DIR, "tool_execution_dir")
 LETTA_MODEL_ENDPOINT = "https://inference.letta.com/v1/"
 DEFAULT_TIMEZONE = "UTC"
 
+# Provider ordering for model listing (matches original _enabled_providers list order)
+PROVIDER_ORDER = {
+    "letta": 0,
+    "openai": 1,
+    "anthropic": 2,
+    "ollama": 3,
+    "google_ai": 4,
+    "google_vertex": 5,
+    "azure": 6,
+    "groq": 7,
+    "together": 8,
+    "vllm": 9,
+    "bedrock": 10,
+    "deepseek": 11,
+    "xai": 12,
+    "lmstudio": 13,
+    "zai": 14,
+    "zai_coding": 15,
+    "openrouter": 16,
+}
+
 ADMIN_PREFIX = "/v1/admin"
 API_PREFIX = "/v1"
 OLLAMA_API_PREFIX = "/v1"
@@ -15,6 +36,7 @@ OPENAI_API_PREFIX = "/openai"
 
 MCP_CONFIG_NAME = "mcp_config.json"
 MCP_TOOL_TAG_NAME_PREFIX = "mcp"  # full format, mcp:server_name
+SUBAGENT_ROLE_TAG = "role:subagent"
 
 LETTA_CORE_TOOL_MODULE_NAME = "letta.functions.function_sets.base"
 LETTA_MULTI_AGENT_TOOL_MODULE_NAME = "letta.functions.function_sets.multi_agent"
@@ -54,12 +76,11 @@ DEFAULT_MAX_STEPS = 50
 
 # context window size
 MIN_CONTEXT_WINDOW = 4096
-DEFAULT_CONTEXT_WINDOW = 32000
+DEFAULT_CONTEXT_WINDOW = 128000
 
 # Summarization trigger threshold (multiplier of context_window limit)
 # Summarization triggers when step usage > context_window * SUMMARIZATION_TRIGGER_MULTIPLIER
-# Set to 0.9 (90%) to provide buffer before hitting hard limit
-SUMMARIZATION_TRIGGER_MULTIPLIER = 0.9
+SUMMARIZATION_TRIGGER_MULTIPLIER = 0.9  # using instead of 1.0 to avoid "too many tokens in prompt" fallbacks
 
 # number of concurrent embedding requests to sent
 EMBEDDING_BATCH_SIZE = 200
@@ -94,7 +115,7 @@ SEND_MESSAGE_TOOL_NAME = "send_message"
 BASE_TOOLS = [SEND_MESSAGE_TOOL_NAME, "conversation_search", "archival_memory_insert", "archival_memory_search"]
 DEPRECATED_LETTA_TOOLS = ["archival_memory_insert", "archival_memory_search"]
 # Base memory tools CAN be edited, and are added by default by the server
-BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace", "memory"]
+BASE_MEMORY_TOOLS = ["core_memory_append", "core_memory_replace", "memory", "memory_apply_patch"]
 # New v2 collection of the base memory tools (effecitvely same as sleeptime set), to pair with memgpt_v2 prompt
 BASE_MEMORY_TOOLS_V2 = [
     "memory_replace",
@@ -143,7 +164,7 @@ MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX = re.compile(
 )
 
 # Built in tools
-BUILTIN_TOOLS = ["run_code", "web_search", "fetch_webpage"]
+BUILTIN_TOOLS = ["run_code", "run_code_with_tools", "web_search", "fetch_webpage"]
 
 # Built in tools
 FILES_TOOLS = ["open_files", "grep_files", "semantic_search_files"]
@@ -196,6 +217,8 @@ PRE_EXECUTION_MESSAGE_ARG = "pre_exec_msg"
 REQUEST_HEARTBEAT_PARAM = "request_heartbeat"
 REQUEST_HEARTBEAT_DESCRIPTION = "Request an immediate heartbeat after function execution. You MUST set this value to `True` if you want to send a follow-up message or run a follow-up tool call (chain multiple tools together). If set to `False` (the default), then the chain of execution will end immediately after this function call."
 
+# Automated tool call denials
+TOOL_CALL_DENIAL_ON_CANCEL = "The user cancelled the request, so the tool call was denied."
 
 # Structured output models
 STRUCTURED_OUTPUT_MODELS = {"gpt-4o", "gpt-4o-mini"}
@@ -225,11 +248,21 @@ CORE_MEMORY_LINE_NUMBER_WARNING = "# NOTE: Line numbers shown below (with arrows
 
 # Constants to do with summarization / conversation length window
 # The max amount of tokens supported by the underlying model (eg 8k for gpt-4 and Mistral 7B)
-LLM_MAX_TOKENS = {
+LLM_MAX_CONTEXT_WINDOW = {
     "DEFAULT": 30000,
     # deepseek
     "deepseek-chat": 64000,
     "deepseek-reasoner": 64000,
+    # glm (Z.AI)
+    "glm-4.5": 128000,
+    "glm-4.6": 180000,
+    "glm-4.7": 180000,
+    "glm-5": 180000,
+    "glm-5-code": 180000,
+    # kimi (moonshot)
+    "kimi-k2.5": 262144,
+    "kimi-k2-thinking": 256000,
+    "kimi-k2-0905": 262144,
     ## OpenAI models: https://platform.openai.com/docs/models/overview
     # gpt-5
     "gpt-5": 272000,
@@ -244,6 +277,21 @@ LLM_MAX_TOKENS = {
     "gpt-5.1-2025-11-13": 272000,
     "gpt-5.1-codex": 272000,
     "gpt-5.1-codex-mini": 272000,
+    "gpt-5.1-codex-max": 272000,
+    # gpt-5.2
+    "gpt-5.2": 272000,
+    "gpt-5.2-2025-12-11": 272000,
+    "gpt-5.2-pro": 272000,
+    "gpt-5.2-pro-2025-12-11": 272000,
+    "gpt-5.2-codex": 272000,
+    # gpt-5.3
+    "gpt-5.3-codex": 272000,
+    # gpt-5.4
+    "gpt-5.4": 1050000,
+    "gpt-5.4-fast": 1050000,
+    "gpt-5.4-2026-03-05": 1050000,
+    "gpt-5.4-mini": 400000,
+    "gpt-5.4-nano": 400000,
     # reasoners
     "o1": 200000,
     # "o1-pro": 200000,  # responses API only
@@ -350,6 +398,9 @@ LLM_MAX_TOKENS = {
     "gemini-2.5-flash-preview-09-2025": 1048576,
     "gemini-2.5-flash-lite-preview-09-2025": 1048576,
     "gemini-2.5-computer-use-preview-10-2025": 1048576,
+    # gemini 3
+    "gemini-3.1-pro-preview": 1048576,
+    "gemini-3-flash-preview": 1048576,
     # gemini latest aliases
     "gemini-flash-latest": 1048576,
     "gemini-flash-lite-latest": 1048576,
@@ -381,7 +432,7 @@ MAX_ERROR_MESSAGE_CHAR_LIMIT = 1000
 # Default memory limits
 CORE_MEMORY_PERSONA_CHAR_LIMIT: int = 20000
 CORE_MEMORY_HUMAN_CHAR_LIMIT: int = 20000
-CORE_MEMORY_BLOCK_CHAR_LIMIT: int = 20000
+CORE_MEMORY_BLOCK_CHAR_LIMIT: int = 100000
 
 # Function return limits
 FUNCTION_RETURN_CHAR_LIMIT = 50000  # ~300 words
@@ -419,10 +470,26 @@ REDIS_SET_DEFAULT_VAL = "None"
 REDIS_DEFAULT_CACHE_PREFIX = "letta_cache"
 REDIS_RUN_ID_PREFIX = "agent:send_message:run_id"
 
+# Conversation lock constants
+CONVERSATION_LOCK_PREFIX = "conversation:lock:"
+CONVERSATION_LOCK_TTL_SECONDS = 300  # 5 minutes
+
+# OTID -> run_id mapping (for recovering from duplicate requests)
+OTID_RUN_PREFIX = "otid:run:"
+OTID_RUN_TTL_SECONDS = 10800  # 3 hours (same as stream TTL)
+
+# Memory repo locks - prevents concurrent modifications to git-based memory
+MEMORY_REPO_LOCK_PREFIX = "memory_repo:lock:"
+MEMORY_REPO_LOCK_TTL_SECONDS = 60  # 1 minute (git operations should be fast)
+
 # TODO: This is temporary, eventually use token-based eviction
 # File based controls
 DEFAULT_MAX_FILES_OPEN = 5
 DEFAULT_CORE_MEMORY_SOURCE_CHAR_LIMIT: int = 50000
+# Max values for file controls (int32 limit to match database INTEGER type)
+MAX_INT32: int = 2147483647
+MAX_PER_FILE_VIEW_WINDOW_CHAR_LIMIT: int = MAX_INT32
+MAX_FILES_OPEN_LIMIT: int = 1000  # Practical limit - no agent needs 1000+ files open
 
 GET_PROVIDERS_TIMEOUT_SECONDS = 10
 
@@ -465,3 +532,7 @@ MODAL_DEFAULT_PYTHON_VERSION = "3.12"
 MODAL_SAFE_IMPORT_MODULES = {"typing", "pydantic", "datetime", "uuid"}  # decimal, enum
 # Default handle for model used to generate tools
 DEFAULT_GENERATE_TOOL_MODEL_HANDLE = "openai/gpt-4.1"
+
+# Reserved keyword arguments that are injected by the system into tool functions, not provided by the LLM
+# These parameters are excluded from tool schema generation
+TOOL_RESERVED_KWARGS = ["self", "agent_state"]

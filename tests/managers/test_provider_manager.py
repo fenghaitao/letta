@@ -1,12 +1,10 @@
 """Tests for ProviderManager encryption/decryption logic."""
 
-import os
-
 import pytest
 
 from letta.orm.provider import Provider as ProviderModel
 from letta.schemas.enums import ProviderCategory, ProviderType
-from letta.schemas.providers import Provider, ProviderCreate, ProviderUpdate
+from letta.schemas.providers import ProviderCreate, ProviderUpdate
 from letta.schemas.secret import Secret
 from letta.server.db import db_registry
 from letta.services.organization_manager import OrganizationManager
@@ -73,8 +71,8 @@ async def test_provider_create_encrypts_api_key(provider_manager, default_user, 
     assert created_provider.name == "test-openai-provider"
     assert created_provider.provider_type == ProviderType.openai
 
-    # Verify plaintext api_key is still accessible (dual-write during migration)
-    assert created_provider.api_key == "sk-test-plaintext-api-key-12345"
+    # Verify encrypted api_key can be decrypted
+    assert created_provider.api_key_enc.get_plaintext() == "sk-test-plaintext-api-key-12345"
 
     # Read directly from database to verify encryption
     async with db_registry.async_session() as session:
@@ -84,14 +82,10 @@ async def test_provider_create_encrypts_api_key(provider_manager, default_user, 
             actor=default_user,
         )
 
-        # Verify plaintext column has the value (dual-write)
-        assert provider_orm.api_key == "sk-test-plaintext-api-key-12345"
-
-        # Verify encrypted column is populated and different from plaintext
+        # Verify encrypted column is populated and decrypts correctly
         assert provider_orm.api_key_enc is not None
-        assert provider_orm.api_key_enc != "sk-test-plaintext-api-key-12345"
-        # Encrypted value should be base64-encoded and longer
-        assert len(provider_orm.api_key_enc) > len("sk-test-plaintext-api-key-12345")
+        decrypted = Secret.from_encrypted(provider_orm.api_key_enc).get_plaintext()
+        assert decrypted == "sk-test-plaintext-api-key-12345"
 
 
 @pytest.mark.asyncio
@@ -110,13 +104,8 @@ async def test_provider_read_decrypts_api_key(provider_manager, default_user, en
     # Read the provider back
     retrieved_provider = await provider_manager.get_provider_async(provider_id, actor=default_user)
 
-    # Verify the api_key is decrypted correctly
-    assert retrieved_provider.api_key == "sk-ant-test-key-67890"
-
-    # Verify we can get the decrypted key through the secret getter
-    api_key_secret = retrieved_provider.get_api_key_secret()
-    assert isinstance(api_key_secret, Secret)
-    decrypted_key = api_key_secret.get_plaintext()
+    # Verify the api_key is decrypted correctly via api_key_enc
+    decrypted_key = retrieved_provider.api_key_enc.get_plaintext()
     assert decrypted_key == "sk-ant-test-key-67890"
 
 
@@ -140,8 +129,8 @@ async def test_provider_update_encrypts_new_api_key(provider_manager, default_us
 
     updated_provider = await provider_manager.update_provider_async(provider_id, provider_update, actor=default_user)
 
-    # Verify the updated key is accessible
-    assert updated_provider.api_key == "gsk-updated-key-456"
+    # Verify the updated key is accessible via the encrypted field
+    assert updated_provider.api_key_enc.get_plaintext() == "gsk-updated-key-456"
 
     # Read from DB to verify new encrypted value
     async with db_registry.async_session() as session:
@@ -151,11 +140,7 @@ async def test_provider_update_encrypts_new_api_key(provider_manager, default_us
             actor=default_user,
         )
 
-        # Verify both columns are updated
-        assert provider_orm.api_key == "gsk-updated-key-456"
         assert provider_orm.api_key_enc is not None
-
-        # Decrypt and verify
         decrypted = Secret.from_encrypted(provider_orm.api_key_enc).get_plaintext()
         assert decrypted == "gsk-updated-key-456"
 
@@ -174,9 +159,9 @@ async def test_bedrock_credentials_encryption(provider_manager, default_user, en
 
     created_provider = await provider_manager.create_provider_async(provider_create, actor=default_user)
 
-    # Verify both keys are accessible
-    assert created_provider.api_key == "secret-access-key-xyz"
-    assert created_provider.access_key == "access-key-id-abc"
+    # Verify both keys are accessible via encrypted fields
+    assert created_provider.api_key_enc.get_plaintext() == "secret-access-key-xyz"
+    assert created_provider.access_key_enc.get_plaintext() == "access-key-id-abc"
 
     # Read from DB to verify both are encrypted
     async with db_registry.async_session() as session:
@@ -191,8 +176,8 @@ async def test_bedrock_credentials_encryption(provider_manager, default_user, en
         assert provider_orm.access_key_enc is not None
 
         # Verify encrypted values are different from plaintext
-        assert provider_orm.api_key_enc != "secret-access-key-xyz"
-        assert provider_orm.access_key_enc != "access-key-id-abc"
+        assert Secret.from_encrypted(provider_orm.api_key_enc).get_plaintext() == "secret-access-key-xyz"
+        assert Secret.from_encrypted(provider_orm.access_key_enc).get_plaintext() == "access-key-id-abc"
 
     # Test the manager method for getting Bedrock credentials
     access_key, secret_key, region = await provider_manager.get_bedrock_credentials_async("test-bedrock-provider", actor=default_user)
@@ -215,7 +200,7 @@ async def test_provider_secret_not_exposed_in_logs(provider_manager, default_use
     created_provider = await provider_manager.create_provider_async(provider_create, actor=default_user)
 
     # Get the Secret object
-    api_key_secret = created_provider.get_api_key_secret()
+    api_key_secret = created_provider.api_key_enc
 
     # Verify string representation doesn't expose the key
     secret_str = str(api_key_secret)
@@ -240,19 +225,19 @@ async def test_provider_pydantic_to_orm_serialization(provider_manager, default_
 
     # Step 1: Create provider (Pydantic → ORM)
     created_provider = await provider_manager.create_provider_async(provider_create, actor=default_user)
-    original_api_key = created_provider.api_key
+    original_api_key = created_provider.api_key_enc.get_plaintext()
 
     # Step 2: Read provider back (ORM → Pydantic)
     retrieved_provider = await provider_manager.get_provider_async(created_provider.id, actor=default_user)
 
     # Verify data integrity
-    assert retrieved_provider.api_key == original_api_key
+    assert retrieved_provider.api_key_enc.get_plaintext() == original_api_key
     assert retrieved_provider.name == "test-roundtrip-provider"
     assert retrieved_provider.provider_type == ProviderType.openai
     assert retrieved_provider.base_url == "https://api.openai.com/v1"
 
     # Verify Secret object works correctly
-    api_key_secret = retrieved_provider.get_api_key_secret()
+    api_key_secret = retrieved_provider.api_key_enc
     assert api_key_secret.get_plaintext() == original_api_key
 
     # Step 3: Convert to ORM again (should preserve encrypted field)
@@ -261,7 +246,7 @@ async def test_provider_pydantic_to_orm_serialization(provider_manager, default_
     # Verify encrypted field is in the ORM data
     assert "api_key_enc" in orm_data
     assert orm_data["api_key_enc"] is not None
-    assert orm_data["api_key"] == original_api_key
+    assert Secret.from_encrypted(orm_data["api_key_enc"]).get_plaintext() == original_api_key
 
 
 @pytest.mark.asyncio
@@ -290,8 +275,8 @@ async def test_provider_with_none_api_key(provider_manager, default_user, encryp
         )
 
         # api_key_enc should handle empty string appropriately
-        # (encrypt empty string or store as None)
-        assert provider_orm.api_key_enc is not None or provider_orm.api_key == ""
+        assert provider_orm.api_key_enc is not None
+        assert Secret.from_encrypted(provider_orm.api_key_enc).get_plaintext() == ""
 
 
 @pytest.mark.asyncio
@@ -316,9 +301,7 @@ async def test_list_providers_decrypts_all(provider_manager, default_user, encry
     # Verify all are decrypted correctly
     assert len(test_providers) == 3
     for i, provider in enumerate(sorted(test_providers, key=lambda p: p.name)):
-        assert provider.api_key == f"sk-key-{i}"
-        # Verify Secret getter works
-        secret = provider.get_api_key_secret()
+        secret = provider.api_key_enc
         assert secret.get_plaintext() == f"sk-key-{i}"
 
 
@@ -499,3 +482,469 @@ async def test_byok_provider_auto_syncs_models(provider_manager, default_user, m
     llm_config = await provider_manager.get_llm_config_from_handle(handle="my-openai-key/gpt-4o", actor=default_user)
     assert llm_config.model == "gpt-4o"
     assert llm_config.provider_name == "my-openai-key"
+
+
+# ======================================================================================================================
+# Server Startup Provider Sync Tests
+# ======================================================================================================================
+
+
+@pytest.mark.asyncio
+async def test_server_startup_syncs_base_providers(default_user, default_organization, monkeypatch):
+    """Test that server startup properly syncs base provider models from environment.
+
+    This test simulates the server startup process and verifies that:
+    1. Base providers from environment variables are synced to database
+    2. Provider models are fetched from mocked API endpoints
+    3. Models are properly persisted to the database with correct metadata
+    4. Models can be retrieved using handles
+    """
+
+    from letta.server.server import SyncServer
+
+    # Mock OpenAI API responses
+    mock_openai_models = {
+        "data": [
+            {
+                "id": "gpt-4",
+                "object": "model",
+                "created": 1687882411,
+                "owned_by": "openai",
+                "max_model_len": 8192,
+            },
+            {
+                "id": "gpt-4-turbo",
+                "object": "model",
+                "created": 1712361441,
+                "owned_by": "system",
+                "max_model_len": 128000,
+            },
+            {
+                "id": "text-embedding-ada-002",
+                "object": "model",
+                "created": 1671217299,
+                "owned_by": "openai-internal",
+            },
+            {
+                "id": "gpt-4-vision",  # Should be filtered out by OpenAI provider logic (has disallowed keyword)
+                "object": "model",
+                "created": 1698959748,
+                "owned_by": "system",
+                "max_model_len": 8192,
+            },
+        ]
+    }
+
+    # Mock Anthropic API responses
+    mock_anthropic_models = {
+        "data": [
+            {
+                "id": "claude-3-5-sonnet-20241022",
+                "type": "model",
+                "display_name": "Claude 3.5 Sonnet",
+                "created_at": "2024-10-22T00:00:00Z",
+            },
+            {
+                "id": "claude-3-opus-20240229",
+                "type": "model",
+                "display_name": "Claude 3 Opus",
+                "created_at": "2024-02-29T00:00:00Z",
+            },
+        ]
+    }
+
+    # Mock the API calls for OpenAI
+    async def mock_openai_get_model_list_async(*args, **kwargs):
+        return mock_openai_models
+
+    # Mock Anthropic models.list() response as an async iterable
+    # (the real SDK returns an AsyncPage that supports async iteration)
+
+    class MockAnthropicModelItem:
+        def __init__(self, data):
+            self._data = data
+
+        def model_dump(self):
+            return self._data
+
+    class MockAnthropicAsyncPage:
+        def __init__(self, items):
+            self._items = [MockAnthropicModelItem(item) for item in items]
+
+        def __aiter__(self):
+            return self._async_iter()
+
+        async def _async_iter(self):
+            for item in self._items:
+                yield item
+
+    # Mock the Anthropic AsyncAnthropic client
+    # NOTE: list() must be a regular (non-async) method that returns an async iterable,
+    # because the real Anthropic SDK's models.list() returns an AsyncPage (which has __aiter__)
+    # directly, and the code uses `async for model in client.models.list()`.
+    class MockAnthropicModels:
+        def list(self):
+            return MockAnthropicAsyncPage(mock_anthropic_models["data"])
+
+    class MockAsyncAnthropic:
+        def __init__(self, *args, **kwargs):
+            self.models = MockAnthropicModels()
+
+    # Patch the actual API calling functions
+    monkeypatch.setattr(
+        "letta.llm_api.openai.openai_get_model_list_async",
+        mock_openai_get_model_list_async,
+    )
+    monkeypatch.setattr(
+        "anthropic.AsyncAnthropic",
+        MockAsyncAnthropic,
+    )
+
+    # Clear ALL provider-related env vars first to ensure clean state
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("AZURE_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("TOGETHER_API_KEY", raising=False)
+    monkeypatch.delenv("VLLM_API_BASE", raising=False)
+    monkeypatch.delenv("SGLANG_API_BASE", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("LMSTUDIO_BASE_URL", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
+
+    # Set environment variables to enable only OpenAI and Anthropic
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-12345")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-67890")
+
+    # Reload model_settings to pick up new env vars
+    from letta.settings import model_settings
+
+    monkeypatch.setattr(model_settings, "openai_api_key", "sk-test-key-12345")
+    monkeypatch.setattr(model_settings, "anthropic_api_key", "sk-ant-test-key-67890")
+    monkeypatch.setattr(model_settings, "gemini_api_key", None)
+    monkeypatch.setattr(model_settings, "google_cloud_project", None)
+    monkeypatch.setattr(model_settings, "google_cloud_location", None)
+    monkeypatch.setattr(model_settings, "azure_api_key", None)
+    monkeypatch.setattr(model_settings, "groq_api_key", None)
+    monkeypatch.setattr(model_settings, "together_api_key", None)
+    monkeypatch.setattr(model_settings, "vllm_api_base", None)
+    monkeypatch.setattr(model_settings, "sglang_api_base", None)
+    monkeypatch.setattr(model_settings, "aws_access_key_id", None)
+    monkeypatch.setattr(model_settings, "aws_secret_access_key", None)
+    monkeypatch.setattr(model_settings, "lmstudio_base_url", None)
+    monkeypatch.setattr(model_settings, "deepseek_api_key", None)
+    monkeypatch.setattr(model_settings, "xai_api_key", None)
+    monkeypatch.setattr(model_settings, "openrouter_api_key", None)
+    monkeypatch.setattr(model_settings, "zai_api_key", None)
+
+    # Create server instance (this will load enabled providers from environment)
+    server = SyncServer(init_with_default_org_and_user=False)
+
+    # Manually set up the default user/org (since we disabled auto-init)
+    server.default_user = default_user
+    server.default_org = default_organization
+
+    # Verify enabled providers were loaded
+    assert len(server._enabled_providers) == 3  # Exactly: letta, openai, anthropic
+    enabled_provider_names = [p.name for p in server._enabled_providers]
+    assert "letta" in enabled_provider_names
+    assert "openai" in enabled_provider_names
+    assert "anthropic" in enabled_provider_names
+
+    # First, sync base providers to database (this is what init_async does)
+    await server.provider_manager.sync_base_providers(
+        base_providers=server._enabled_providers,
+        actor=default_user,
+    )
+
+    # Now call the actual _sync_provider_models_async method
+    # This simulates what happens during server startup
+    await server._sync_provider_models_async()
+
+    # Verify OpenAI models were synced
+    openai_providers = await server.provider_manager.list_providers_async(
+        name="openai",
+        actor=default_user,
+    )
+    assert len(openai_providers) == 1, "OpenAI provider should exist"
+    openai_provider = openai_providers[0]
+
+    # Check OpenAI LLM models
+    openai_llm_models = await server.provider_manager.list_models_async(
+        actor=default_user,
+        provider_id=openai_provider.id,
+        model_type="llm",
+    )
+
+    # Should have gpt-4 and gpt-4-turbo (gpt-4-vision filtered out due to "vision" keyword)
+    assert len(openai_llm_models) >= 2, f"Expected at least 2 OpenAI LLM models, got {len(openai_llm_models)}"
+    openai_model_names = [m.name for m in openai_llm_models]
+    assert "gpt-4" in openai_model_names
+    assert "gpt-4-turbo" in openai_model_names
+
+    # Check OpenAI embedding models
+    openai_embedding_models = await server.provider_manager.list_models_async(
+        actor=default_user,
+        provider_id=openai_provider.id,
+        model_type="embedding",
+    )
+    assert len(openai_embedding_models) >= 1, "Expected at least 1 OpenAI embedding model"
+    embedding_model_names = [m.name for m in openai_embedding_models]
+    assert "text-embedding-ada-002" in embedding_model_names
+
+    # Verify model metadata is correct
+    gpt4_models = [m for m in openai_llm_models if m.name == "gpt-4"]
+    assert len(gpt4_models) > 0, "gpt-4 model should exist"
+    gpt4_model = gpt4_models[0]
+    assert gpt4_model.handle == "openai/gpt-4"
+    assert gpt4_model.model_endpoint_type == "openai"
+    assert gpt4_model.max_context_window == 8192
+    assert gpt4_model.enabled is True
+
+    # Verify Anthropic models were synced
+    anthropic_providers = await server.provider_manager.list_providers_async(
+        name="anthropic",
+        actor=default_user,
+    )
+    assert len(anthropic_providers) == 1, "Anthropic provider should exist"
+    anthropic_provider = anthropic_providers[0]
+
+    anthropic_llm_models = await server.provider_manager.list_models_async(
+        actor=default_user,
+        provider_id=anthropic_provider.id,
+        model_type="llm",
+    )
+
+    # Should have Claude models
+    assert len(anthropic_llm_models) >= 2, f"Expected at least 2 Anthropic models, got {len(anthropic_llm_models)}"
+    anthropic_model_names = [m.name for m in anthropic_llm_models]
+    assert "claude-3-5-sonnet-20241022" in anthropic_model_names
+    assert "claude-3-opus-20240229" in anthropic_model_names
+
+    # Test that we can retrieve LLMConfig from handle
+    llm_config = await server.provider_manager.get_llm_config_from_handle(
+        handle="openai/gpt-4",
+        actor=default_user,
+    )
+    assert llm_config.model == "gpt-4"
+    assert llm_config.handle == "openai/gpt-4"
+    assert llm_config.provider_name == "openai"
+    assert llm_config.context_window == 8192
+
+    # Test that we can retrieve EmbeddingConfig from handle
+    embedding_config = await server.provider_manager.get_embedding_config_from_handle(
+        handle="openai/text-embedding-ada-002",
+        actor=default_user,
+    )
+    assert embedding_config.embedding_model == "text-embedding-ada-002"
+    assert embedding_config.handle == "openai/text-embedding-ada-002"
+    assert embedding_config.embedding_dim == 1536
+
+
+@pytest.mark.asyncio
+async def test_server_startup_handles_disabled_providers(default_user, default_organization, monkeypatch):
+    """Test that server startup properly handles providers that are no longer enabled.
+
+    This test verifies that:
+    1. Base providers that are no longer enabled (env vars removed) are deleted
+    2. BYOK providers that are no longer enabled are NOT deleted (user-created)
+    3. The sync process handles providers gracefully when API calls fail
+    """
+    from letta.schemas.providers import ProviderCreate
+    from letta.server.server import SyncServer
+
+    # First, manually create providers in the database
+    provider_manager = ProviderManager()
+
+    # Create a base OpenAI provider (simulating it was synced before)
+    base_openai_create = ProviderCreate(
+        name="openai",
+        provider_type=ProviderType.openai,
+        api_key="sk-old-key",
+        base_url="https://api.openai.com/v1",
+    )
+    base_openai = await provider_manager.create_provider_async(
+        base_openai_create,
+        actor=default_user,
+        is_byok=False,  # This is a base provider
+    )
+
+    # Create a BYOK provider (user-created)
+    byok_provider_create = ProviderCreate(
+        name="my-custom-openai",
+        provider_type=ProviderType.openai,
+        api_key="sk-my-key",
+        base_url="https://api.openai.com/v1",
+    )
+    byok_provider = await provider_manager.create_provider_async(
+        byok_provider_create,
+        actor=default_user,
+        is_byok=True,
+    )
+    assert byok_provider.provider_category == ProviderCategory.byok
+
+    # Now create server with NO environment variables set (all base providers disabled)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    from letta.settings import model_settings
+
+    monkeypatch.setattr(model_settings, "openai_api_key", None)
+    monkeypatch.setattr(model_settings, "anthropic_api_key", None)
+
+    # Create server instance
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.default_org = default_organization
+
+    # Verify only letta provider is enabled (no openai)
+    enabled_names = [p.name for p in server._enabled_providers]
+    assert "letta" in enabled_names
+    assert "openai" not in enabled_names
+
+    # Sync base providers (should not include openai anymore)
+    await server.provider_manager.sync_base_providers(
+        base_providers=server._enabled_providers,
+        actor=default_user,
+    )
+
+    # Call _sync_provider_models_async
+    await server._sync_provider_models_async()
+
+    # Verify base OpenAI provider was deleted (no longer enabled)
+    try:
+        await server.provider_manager.get_provider_async(base_openai.id, actor=default_user)
+        assert False, "Base OpenAI provider should have been deleted"
+    except Exception:
+        # Expected - provider should not exist
+        pass
+
+    # Verify BYOK provider still exists (should NOT be deleted)
+    byok_still_exists = await server.provider_manager.get_provider_async(
+        byok_provider.id,
+        actor=default_user,
+    )
+    assert byok_still_exists is not None
+    assert byok_still_exists.name == "my-custom-openai"
+    assert byok_still_exists.provider_category == ProviderCategory.byok
+
+
+@pytest.mark.asyncio
+async def test_server_startup_handles_api_errors_gracefully(default_user, default_organization, monkeypatch):
+    """Test that server startup handles API errors gracefully without crashing.
+
+    This test verifies that:
+    1. If a provider's API call fails during sync, it logs an error but continues
+    2. Other providers can still sync successfully
+    3. The server startup completes without crashing
+    """
+    from letta.server.server import SyncServer
+
+    # Mock OpenAI to fail
+    async def mock_openai_fail(*args, **kwargs):
+        raise Exception("OpenAI API is down")
+
+    # Mock Anthropic to succeed (as async iterable, matching real SDK pagination)
+
+    mock_anthropic_data = [
+        {
+            "id": "claude-3-5-sonnet-20241022",
+            "type": "model",
+            "display_name": "Claude 3.5 Sonnet",
+            "created_at": "2024-10-22T00:00:00Z",
+        }
+    ]
+
+    class MockAnthropicModelItem:
+        def __init__(self, data):
+            self._data = data
+
+        def model_dump(self):
+            return self._data
+
+    class MockAnthropicAsyncPage:
+        def __init__(self, items):
+            self._items = [MockAnthropicModelItem(item) for item in items]
+
+        def __aiter__(self):
+            return self._async_iter()
+
+        async def _async_iter(self):
+            for item in self._items:
+                yield item
+
+    # NOTE: The real SDK's models.list() is a regular (non-async) method that
+    # returns an AsyncPaginator (which is async-iterable).
+    class MockAnthropicModels:
+        def list(self):
+            return MockAnthropicAsyncPage(mock_anthropic_data)
+
+    class MockAsyncAnthropic:
+        def __init__(self, *args, **kwargs):
+            self.models = MockAnthropicModels()
+
+    monkeypatch.setattr(
+        "letta.llm_api.openai.openai_get_model_list_async",
+        mock_openai_fail,
+    )
+    monkeypatch.setattr(
+        "anthropic.AsyncAnthropic",
+        MockAsyncAnthropic,
+    )
+
+    # Set environment variables
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+
+    from letta.settings import model_settings
+
+    monkeypatch.setattr(model_settings, "openai_api_key", "sk-test-key")
+    monkeypatch.setattr(model_settings, "anthropic_api_key", "sk-ant-test-key")
+
+    # Create server
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.default_org = default_organization
+
+    # Sync base providers
+    await server.provider_manager.sync_base_providers(
+        base_providers=server._enabled_providers,
+        actor=default_user,
+    )
+
+    # This should NOT crash even though OpenAI fails
+    await server._sync_provider_models_async()
+
+    # Verify Anthropic still synced successfully
+    anthropic_providers = await server.provider_manager.list_providers_async(
+        name="anthropic",
+        actor=default_user,
+    )
+    assert len(anthropic_providers) == 1
+
+    anthropic_models = await server.provider_manager.list_models_async(
+        actor=default_user,
+        provider_id=anthropic_providers[0].id,
+        model_type="llm",
+    )
+    assert len(anthropic_models) >= 1, "Anthropic models should have synced despite OpenAI failure"
+
+    # OpenAI should have no models (sync failed)
+    openai_providers = await server.provider_manager.list_providers_async(
+        name="openai",
+        actor=default_user,
+    )
+    if len(openai_providers) > 0:
+        await server.provider_manager.list_models_async(
+            actor=default_user,
+            provider_id=openai_providers[0].id,
+        )
+        # Models might exist from previous runs, but the sync attempt should have been logged as failed
+        # The key is that the server didn't crash

@@ -1,7 +1,7 @@
 import functools
 import os
 import time
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from letta_client import AsyncLetta, Letta
 
@@ -186,6 +186,9 @@ def validate_context_window_overview(
     # 2. All token counts should be non-negative
     assert overview.num_tokens_system >= 0, "System token count cannot be negative"
     assert overview.num_tokens_core_memory >= 0, "Core memory token count cannot be negative"
+    assert overview.num_tokens_memory_filesystem >= 0, "Memory filesystem token count cannot be negative"
+    assert overview.num_tokens_tool_usage_rules >= 0, "Tool usage rules token count cannot be negative"
+    assert overview.num_tokens_directories >= 0, "Directories token count cannot be negative"
     assert overview.num_tokens_external_memory_summary >= 0, "External memory summary token count cannot be negative"
     assert overview.num_tokens_summary_memory >= 0, "Summary memory token count cannot be negative"
     assert overview.num_tokens_messages >= 0, "Messages token count cannot be negative"
@@ -195,6 +198,9 @@ def validate_context_window_overview(
     expected_total = (
         overview.num_tokens_system
         + overview.num_tokens_core_memory
+        + overview.num_tokens_memory_filesystem
+        + overview.num_tokens_tool_usage_rules
+        + overview.num_tokens_directories
         + overview.num_tokens_external_memory_summary
         + overview.num_tokens_summary_memory
         + overview.num_tokens_messages
@@ -244,13 +250,14 @@ def validate_context_window_overview(
     avg_tokens_per_message = overview.num_tokens_messages / overview.num_messages
     assert avg_tokens_per_message >= 0, "Average tokens per message should be non-negative"
 
-    # 16. Check attached file is visible
+    # 16. Check attached file is visible in the directories section
     if attached_file:
-        assert attached_file.visible_content in overview.core_memory, "File must be attached in core memory"
-        assert '<file status="open"' in overview.core_memory
-        assert "</file>" in overview.core_memory
-        assert "max_files_open" in overview.core_memory, "Max files should be set in core memory"
-        assert "current_files_open" in overview.core_memory, "Current files should be set in core memory"
+        assert overview.directories is not None, "Directories section must exist when files are attached"
+        assert attached_file.visible_content in overview.directories, "File must be attached in directories"
+        assert '<file status="open"' in overview.directories
+        assert "</file>" in overview.directories
+        assert "max_files_open" in overview.directories, "Max files should be set in directories"
+        assert "current_files_open" in overview.directories, "Current files should be set in directories"
 
     # Check for tools
     assert overview.num_tokens_functions_definitions > 0
@@ -294,22 +301,32 @@ def upload_file_and_wait(
     """Helper function to upload a file and wait for processing to complete"""
     with open(file_path, "rb") as f:
         if duplicate_handling:
-            file_metadata = client.sources.files.upload(source_id=source_id, file=f, duplicate_handling=duplicate_handling, name=name)
+            file_metadata = client.folders.files.upload(folder_id=source_id, file=f, duplicate_handling=duplicate_handling, name=name)
         else:
-            file_metadata = client.sources.files.upload(source_id=source_id, file=f, name=name)
+            file_metadata = client.folders.files.upload(folder_id=source_id, file=f, name=name)
 
     # wait for the file to be processed
     start_time = time.time()
-    while file_metadata.processing_status != "completed" and file_metadata.processing_status != "error":
+    file_metadata_id = file_metadata.id
+    processing_status = file_metadata.processing_status
+    while processing_status != "completed" and processing_status != "error":
         if time.time() - start_time > max_wait:
             raise TimeoutError(f"File processing timed out after {max_wait} seconds")
         time.sleep(1)
-        file_metadata = client.sources.get_file_metadata(source_id=source_id, file_id=file_metadata.id)
-        print("Waiting for file processing to complete...", file_metadata.processing_status)
+        file_metadata = client.get(
+            path=f"/v1/sources/{source_id}/files/{file_metadata_id}",
+            cast_to=dict[str, Any],
+        )
+        print("Waiting for file processing to complete...", file_metadata["processing_status"])
+        processing_status = file_metadata["processing_status"]
 
-    if file_metadata.processing_status == "error":
+    if isinstance(file_metadata, dict) and file_metadata["processing_status"] == "error":
+        raise RuntimeError(f"File processing failed: {file_metadata['error_message']}")
+    elif hasattr(file_metadata, "processing_status") and file_metadata.processing_status == "error":
         raise RuntimeError(f"File processing failed: {file_metadata.error_message}")
 
+    if not isinstance(file_metadata, dict):
+        file_metadata = file_metadata.model_dump()
     return file_metadata
 
 

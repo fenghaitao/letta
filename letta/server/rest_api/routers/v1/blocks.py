@@ -1,14 +1,22 @@
 from typing import TYPE_CHECKING, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, Query
 
 from letta.orm.errors import NoResultFound
 from letta.schemas.agent import AgentRelationships, AgentState
-from letta.schemas.block import BaseBlock, Block, BlockResponse, BlockUpdate, CreateBlock
+from letta.schemas.block import Block, BlockResponse, BlockUpdate, CreateBlock
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
 from letta.server.server import SyncServer
 from letta.utils import is_1_0_sdk_version
-from letta.validators import BlockId
+from letta.validators import (
+    BlockDescriptionSearchQuery,
+    BlockId,
+    BlockLabelQuery,
+    BlockLabelSearchQuery,
+    BlockNameQuery,
+    BlockValueSearchQuery,
+    IdentityIdQuery,
+)
 
 if TYPE_CHECKING:
     pass
@@ -19,12 +27,17 @@ router = APIRouter(prefix="/blocks", tags=["blocks"])
 @router.get("/", response_model=List[BlockResponse], operation_id="list_blocks")
 async def list_blocks(
     # query parameters
-    label: Optional[str] = Query(None, description="Labels to include (e.g. human, persona)"),
+    label: BlockLabelQuery = None,
     templates_only: bool = Query(False, description="Whether to include only templates"),
-    name: Optional[str] = Query(None, description="Name of the block"),
-    identity_id: Optional[str] = Query(None, description="Search agents by identifier id"),
+    name: BlockNameQuery = None,
+    identity_id: IdentityIdQuery = None,
     identifier_keys: Optional[List[str]] = Query(None, description="Search agents by identifier keys"),
     project_id: Optional[str] = Query(None, description="Search blocks by project id"),
+    tags: Optional[List[str]] = Query(None, description="List of tags to filter blocks by"),
+    match_all_tags: bool = Query(
+        False,
+        description="If True, only returns blocks that match ALL given tags. Otherwise, return blocks that have ANY of the passed-in tags.",
+    ),
     limit: Optional[int] = Query(50, description="Number of blocks to return"),
     before: Optional[str] = Query(
         None,
@@ -38,21 +51,9 @@ async def list_blocks(
         "asc", description="Sort order for blocks by creation time. 'asc' for oldest first, 'desc' for newest first"
     ),
     order_by: Literal["created_at"] = Query("created_at", description="Field to sort by"),
-    label_search: Optional[str] = Query(
-        None,
-        description=("Search blocks by label. If provided, returns blocks that match this label. This is a full-text search on labels."),
-    ),
-    description_search: Optional[str] = Query(
-        None,
-        description=(
-            "Search blocks by description. If provided, returns blocks that match this description. "
-            "This is a full-text search on block descriptions."
-        ),
-    ),
-    value_search: Optional[str] = Query(
-        None,
-        description=("Search blocks by value. If provided, returns blocks that match this value."),
-    ),
+    label_search: BlockLabelSearchQuery = None,
+    description_search: BlockDescriptionSearchQuery = None,
+    value_search: BlockValueSearchQuery = None,
     connected_to_agents_count_gt: Optional[int] = Query(
         None,
         description=(
@@ -102,19 +103,44 @@ async def list_blocks(
         after=after,
         ascending=(order == "asc"),
         show_hidden_blocks=show_hidden_blocks,
+        tags=tags,
+        match_all_tags=match_all_tags,
     )
 
 
 @router.get("/count", response_model=int, operation_id="count_blocks")
 async def count_blocks(
+    label: BlockLabelQuery = None,
+    templates_only: bool = Query(False, description="Whether to include only templates"),
+    name: BlockNameQuery = None,
+    tags: Optional[List[str]] = Query(None, description="List of tags to filter blocks by"),
+    match_all_tags: bool = Query(
+        False,
+        description="If True, only counts blocks that match ALL given tags. Otherwise, counts blocks that have ANY of the passed-in tags.",
+    ),
+    project_id: Optional[str] = Query(None, description="Search blocks by project id"),
     server: SyncServer = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
     """
-    Count all blocks created by a user.
+    Count all blocks with optional filtering.
+    Supports the same filters as list_blocks for consistent querying.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    return await server.block_manager.size_async(actor=actor)
+
+    # If no filters are provided, use the simpler size_async method
+    if all(param is None or param is False for param in [label, templates_only, name, tags, project_id]):
+        return await server.block_manager.size_async(actor=actor)
+
+    return await server.block_manager.count_blocks_async(
+        actor=actor,
+        label=label,
+        is_template=templates_only,
+        template_name=name,
+        tags=tags,
+        match_all_tags=match_all_tags,
+        project_id=project_id,
+    )
 
 
 @router.post("/", response_model=BlockResponse, operation_id="create_block")

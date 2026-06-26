@@ -56,7 +56,7 @@ def server_url() -> str:
         thread.start()
 
         # Poll until the server is up (or timeout)
-        timeout_seconds = 30
+        timeout_seconds = 60
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
@@ -79,7 +79,8 @@ def _clear_tables():
         async with db_registry.async_session() as session:
             for table in reversed(Base.metadata.sorted_tables):  # Reverse to avoid FK issues
                 await session.execute(table.delete())  # Truncate table
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
 
     asyncio.run(_clear())
 
@@ -354,7 +355,7 @@ def compare_in_context_message_id_remapping(server, og_agent: AgentState, copy_a
     remapped IDs but identical relevant content and order.
     """
     # Serialize the original agent state
-    result = server.agent_manager.serialize(agent_id=og_agent.id, actor=og_user)
+    server.agent_manager.serialize(agent_id=og_agent.id, actor=og_user)
 
     # Retrieve the in-context messages for both the original and the copy
     # Corrected typo: agent_id instead of agent_id

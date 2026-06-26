@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import BigInteger, ForeignKey, String
+from sqlalchemy import BigInteger, ForeignKey, Index, String
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
@@ -21,6 +21,7 @@ class StepMetrics(SqlalchemyBase, ProjectMixin, AgentMixin):
     """Tracks performance metrics for agent steps."""
 
     __tablename__ = "step_metrics"
+    __table_args__ = (Index("ix_step_metrics_run_id", "run_id"),)
     __pydantic_model__ = PydanticStepMetrics
 
     id: Mapped[str] = mapped_column(
@@ -81,8 +82,8 @@ class StepMetrics(SqlalchemyBase, ProjectMixin, AgentMixin):
 
     # Relationships (foreign keys)
     step: Mapped["Step"] = relationship("Step", back_populates="metrics", uselist=False)
-    run: Mapped[Optional["Run"]] = relationship("Run")
-    agent: Mapped[Optional["Agent"]] = relationship("Agent")
+    run: Mapped[Optional["Run"]] = relationship("Run", lazy="raise")
+    agent: Mapped[Optional["Agent"]] = relationship("Agent", lazy="raise")
 
     def create(
         self,

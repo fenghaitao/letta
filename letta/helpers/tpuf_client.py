@@ -1,12 +1,22 @@
 """Turbopuffer utilities for archival memory storage."""
 
 import asyncio
+import json
 import logging
+import random
 from datetime import datetime, timezone
-from typing import Any, Callable, List, Optional, Tuple
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple, TypeVar
+
+if TYPE_CHECKING:
+    from letta.schemas.tool import Tool as PydanticTool
+    from letta.schemas.user import User as PydanticUser
+
+import httpx
 
 from letta.constants import DEFAULT_EMBEDDING_CHUNK_SIZE
-from letta.otel.tracing import trace_method
+from letta.errors import LettaInvalidArgumentError
+from letta.otel.tracing import log_event, trace_method
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import MessageRole, TagMatchMode
 from letta.schemas.passage import Passage as PydanticPassage
@@ -14,9 +24,185 @@ from letta.settings import model_settings, settings
 
 logger = logging.getLogger(__name__)
 
+# Type variable for generic async retry decorator
+T = TypeVar("T")
+
+# Default retry configuration for turbopuffer operations
+TPUF_MAX_RETRIES = 3
+TPUF_INITIAL_DELAY = 1.0  # seconds
+TPUF_EXPONENTIAL_BASE = 2.0
+TPUF_JITTER = True
+
+
+def is_transient_error(error: Exception) -> bool:
+    """Check if an error is transient and should be retried.
+
+    Args:
+        error: The exception to check
+
+    Returns:
+        True if the error is transient and can be retried
+    """
+    # httpx connection errors (network issues, DNS failures, etc.)
+    if isinstance(error, httpx.ConnectError):
+        return True
+
+    # httpx timeout errors
+    if isinstance(error, httpx.TimeoutException):
+        return True
+
+    # httpx network errors
+    if isinstance(error, httpx.NetworkError):
+        return True
+
+    # Check for connection-related errors in the error message
+    error_str = str(error).lower()
+    transient_patterns = [
+        "connect call failed",
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "temporary failure",
+        "name resolution",
+        "dns",
+        "network unreachable",
+        "no route to host",
+        "ssl handshake",
+    ]
+    for pattern in transient_patterns:
+        if pattern in error_str:
+            return True
+
+    return False
+
+
+def async_retry_with_backoff(
+    max_retries: int = TPUF_MAX_RETRIES,
+    initial_delay: float = TPUF_INITIAL_DELAY,
+    exponential_base: float = TPUF_EXPONENTIAL_BASE,
+    jitter: bool = TPUF_JITTER,
+):
+    """Decorator for async functions that retries on transient errors with exponential backoff.
+
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay between retries in seconds
+        exponential_base: Base for exponential backoff calculation
+        jitter: Whether to add random jitter to delays
+
+    Returns:
+        Decorated async function with retry logic
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> Any:
+            num_retries = 0
+            delay = initial_delay
+
+            while True:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    # Check if this is a retryable error
+                    if not is_transient_error(e):
+                        # Not a transient error, re-raise immediately
+                        raise
+
+                    num_retries += 1
+
+                    # Log the retry attempt
+                    log_event(
+                        "turbopuffer_retry_attempt",
+                        {
+                            "attempt": num_retries,
+                            "delay": delay,
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                            "function": func.__name__,
+                        },
+                    )
+                    logger.warning(
+                        f"Turbopuffer operation '{func.__name__}' failed with transient error "
+                        f"(attempt {num_retries}/{max_retries}): {e}. Retrying in {delay:.1f}s..."
+                    )
+
+                    # Check if max retries exceeded
+                    if num_retries > max_retries:
+                        log_event(
+                            "turbopuffer_max_retries_exceeded",
+                            {
+                                "max_retries": max_retries,
+                                "error_type": type(e).__name__,
+                                "error": str(e),
+                                "function": func.__name__,
+                            },
+                        )
+                        logger.error(f"Turbopuffer operation '{func.__name__}' failed after {max_retries} retries: {e}")
+                        raise
+
+                    # Wait with exponential backoff
+                    await asyncio.sleep(delay)
+
+                    # Calculate next delay with optional jitter
+                    delay *= exponential_base
+                    if jitter:
+                        delay *= 1 + random.random() * 0.1  # Add up to 10% jitter
+
+        return wrapper
+
+    return decorator
+
+
 # Global semaphore for Turbopuffer operations to prevent overwhelming the service
 # This is separate from embedding semaphore since Turbopuffer can handle more concurrency
 _GLOBAL_TURBOPUFFER_SEMAPHORE = asyncio.Semaphore(5)
+
+
+def _run_turbopuffer_write_in_thread(
+    api_key: str,
+    region: str,
+    namespace_name: str,
+    upsert_columns: dict | None = None,
+    deletes: list | None = None,
+    delete_by_filter: tuple | None = None,
+    distance_metric: str = "cosine_distance",
+    schema: dict | None = None,
+):
+    """
+    Sync wrapper to run turbopuffer write in isolated event loop.
+
+    Turbopuffer's async write() does CPU-intensive base64 encoding of vectors
+    synchronously in async functions, blocking the event loop. Running it in
+    a thread pool with an isolated event loop prevents blocking.
+    """
+    from turbopuffer import AsyncTurbopuffer
+
+    # Create new event loop for this worker thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+
+        async def do_write():
+            async with AsyncTurbopuffer(api_key=api_key, region=region) as client:
+                namespace = client.namespace(namespace_name)
+
+                # Build write kwargs
+                kwargs = {"distance_metric": distance_metric}
+                if upsert_columns:
+                    kwargs["upsert_columns"] = upsert_columns
+                if deletes:
+                    kwargs["deletes"] = deletes
+                if delete_by_filter:
+                    kwargs["delete_by_filter"] = delete_by_filter
+                if schema:
+                    kwargs["schema"] = schema
+
+                return await namespace.write(**kwargs)
+
+        return loop.run_until_complete(do_write())
+    finally:
+        loop.close()
 
 
 def should_use_tpuf() -> bool:
@@ -27,6 +213,11 @@ def should_use_tpuf() -> bool:
 def should_use_tpuf_for_messages() -> bool:
     """Check if Turbopuffer should be used for messages."""
     return should_use_tpuf() and bool(settings.embed_all_messages)
+
+
+def should_use_tpuf_for_tools() -> bool:
+    """Check if Turbopuffer should be used for tools."""
+    return should_use_tpuf() and bool(settings.embed_tools)
 
 
 class TurbopufferClient:
@@ -40,7 +231,7 @@ class TurbopufferClient:
         embedding_chunk_size=DEFAULT_EMBEDDING_CHUNK_SIZE,
     )
 
-    def __init__(self, api_key: str = None, region: str = None):
+    def __init__(self, api_key: str | None = None, region: str | None = None):
         """Initialize Turbopuffer client."""
         self.api_key = api_key or settings.tpuf_api_key
         self.region = region or settings.tpuf_region
@@ -53,6 +244,42 @@ class TurbopufferClient:
 
         if not self.api_key:
             raise ValueError("Turbopuffer API key not provided")
+
+    async def hint_cache_warm(self, *, collection: Literal["messages"], scope: dict[str, str]) -> dict:
+        """Fire a cache warm hint for a supported search collection.
+
+        This signals to turbopuffer that latency-sensitive queries are coming,
+        so it can warm the cache before the first search request lands.
+
+        Args:
+            collection: Search collection whose cache should be warmed
+            scope: Collection-specific namespace resolution inputs
+
+        Returns:
+            {"status": "ACCEPTED", "namespace": "...", "collection": "messages"} on success
+        """
+        from turbopuffer import AsyncTurbopuffer
+
+        namespace_name = await self._get_cache_warm_namespace_name(collection=collection, scope=scope)
+
+        try:
+            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
+                ns = client.namespace(namespace_name)
+                result = await ns.hint_cache_warm()
+                return {"status": result.status, "namespace": namespace_name, "collection": collection}
+        except Exception as e:
+            logger.error(f"Failed to warm turbopuffer cache for collection {collection} in namespace {namespace_name}: {e}")
+            raise
+
+    async def _get_cache_warm_namespace_name(self, *, collection: Literal["messages"], scope: dict[str, str]) -> str:
+        """Resolve the namespace for a supported cache-warm collection."""
+        if collection == "messages":
+            return await self._get_message_namespace_name(scope["organization_id"])
+
+        raise LettaInvalidArgumentError(
+            f"Unsupported cache warm collection: {collection}",
+            argument_name="collection",
+        )
 
     @trace_method
     async def _generate_embeddings(self, texts: List[str], actor: "PydanticUser") -> List[List[float]]:
@@ -105,6 +332,162 @@ class TurbopufferClient:
         return namespace_name
 
     @trace_method
+    async def _get_tool_namespace_name(self, organization_id: str) -> str:
+        """Get namespace name for tools (org-scoped).
+
+        Args:
+            organization_id: Organization ID for namespace generation
+
+        Returns:
+            The org-scoped namespace name for tools
+        """
+        environment = settings.environment
+        if environment:
+            namespace_name = f"tools_{organization_id}_{environment.lower()}"
+        else:
+            namespace_name = f"tools_{organization_id}"
+
+        return namespace_name
+
+    def _extract_tool_text(self, tool: "PydanticTool") -> str:
+        """Extract searchable text from a tool for embedding.
+
+        Combines name, description, and JSON schema into a structured format
+        that provides rich context for semantic search.
+
+        Args:
+            tool: The tool to extract text from
+
+        Returns:
+            JSON-formatted string containing tool information
+        """
+
+        parts = {
+            "name": tool.name or "",
+            "description": tool.description or "",
+        }
+
+        # Extract parameter information from JSON schema
+        if tool.json_schema:
+            # Include function description from schema if different from tool description
+            schema_description = tool.json_schema.get("description", "")
+            if schema_description and schema_description != tool.description:
+                parts["schema_description"] = schema_description
+
+            # Extract parameter information
+            parameters = tool.json_schema.get("parameters", {})
+            if parameters:
+                properties = parameters.get("properties", {})
+                param_descriptions = []
+                for param_name, param_info in properties.items():
+                    param_desc = param_info.get("description", "")
+                    param_type = param_info.get("type", "any")
+                    if param_desc:
+                        param_descriptions.append(f"{param_name} ({param_type}): {param_desc}")
+                    else:
+                        param_descriptions.append(f"{param_name} ({param_type})")
+                if param_descriptions:
+                    parts["parameters"] = param_descriptions
+
+        # Include tags for additional context
+        if tool.tags:
+            parts["tags"] = tool.tags
+
+        return json.dumps(parts)
+
+    @trace_method
+    @async_retry_with_backoff()
+    async def insert_tools(
+        self,
+        tools: List["PydanticTool"],
+        organization_id: str,
+        actor: "PydanticUser",
+    ) -> bool:
+        """Insert tools into Turbopuffer.
+
+        Args:
+            tools: List of tools to store
+            organization_id: Organization ID for the tools
+            actor: User actor for embedding generation
+
+        Returns:
+            True if successful
+        """
+
+        if not tools:
+            return True
+
+        # Extract text and filter out empty content
+        tool_texts = []
+        valid_tools = []
+        for tool in tools:
+            text = self._extract_tool_text(tool)
+            if text.strip():
+                tool_texts.append(text)
+                valid_tools.append(tool)
+
+        if not valid_tools:
+            logger.warning("All tools had empty text content, skipping insertion")
+            return True
+
+        # Generate embeddings
+        embeddings = await self._generate_embeddings(tool_texts, actor)
+
+        namespace_name = await self._get_tool_namespace_name(organization_id)
+
+        # Prepare column-based data
+        ids = []
+        vectors = []
+        texts = []
+        names = []
+        organization_ids = []
+        tool_types = []
+        tags_arrays = []
+        created_ats = []
+
+        for tool, text, embedding in zip(valid_tools, tool_texts, embeddings):
+            ids.append(tool.id)
+            vectors.append(embedding)
+            texts.append(text)
+            names.append(tool.name or "")
+            organization_ids.append(organization_id)
+            tool_types.append(tool.tool_type.value if tool.tool_type else "custom")
+            tags_arrays.append(tool.tags or [])
+            created_ats.append(getattr(tool, "created_at", None) or datetime.now(timezone.utc))
+
+        upsert_columns = {
+            "id": ids,
+            "vector": vectors,
+            "text": texts,
+            "name": names,
+            "organization_id": organization_ids,
+            "tool_type": tool_types,
+            "tags": tags_arrays,
+            "created_at": created_ats,
+        }
+
+        try:
+            # Use global semaphore to limit concurrent Turbopuffer writes
+            async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
+                # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                await asyncio.to_thread(
+                    _run_turbopuffer_write_in_thread,
+                    api_key=self.api_key,
+                    region=self.region,
+                    namespace_name=namespace_name,
+                    upsert_columns=upsert_columns,
+                    distance_metric="cosine_distance",
+                    schema={"text": {"type": "string", "full_text_search": True}},
+                )
+                logger.info(f"Successfully inserted {len(ids)} tools to Turbopuffer")
+                return True
+
+        except Exception as e:
+            logger.error(f"Failed to insert tools to Turbopuffer: {e}")
+            raise
+
+    @trace_method
+    @async_retry_with_backoff()
     async def insert_archival_memories(
         self,
         archive_id: str,
@@ -114,6 +497,7 @@ class TurbopufferClient:
         actor: "PydanticUser",
         tags: Optional[List[str]] = None,
         created_at: Optional[datetime] = None,
+        embeddings: Optional[List[List[float]]] = None,
     ) -> List[PydanticPassage]:
         """Insert passages into Turbopuffer.
 
@@ -125,11 +509,11 @@ class TurbopufferClient:
             actor: User actor for embedding generation
             tags: Optional list of tags to attach to all passages
             created_at: Optional timestamp for retroactive entries (defaults to current UTC time)
+            embeddings: Optional pre-computed embeddings (must match 1:1 with text_chunks). If provided, skips embedding generation.
 
         Returns:
             List of PydanticPassage objects that were inserted
         """
-        from turbopuffer import AsyncTurbopuffer
 
         # filter out empty text chunks
         filtered_chunks = [(i, text) for i, text in enumerate(text_chunks) if text.strip()]
@@ -138,9 +522,30 @@ class TurbopufferClient:
             logger.warning("All text chunks were empty, skipping insertion")
             return []
 
-        # generate embeddings using the default config
         filtered_texts = [text for _, text in filtered_chunks]
-        embeddings = await self._generate_embeddings(filtered_texts, actor)
+
+        # use provided embeddings only if dimensions match TPUF's expected dimension
+        use_provided_embeddings = False
+        if embeddings is not None:
+            if len(embeddings) != len(text_chunks):
+                raise LettaInvalidArgumentError(
+                    f"embeddings length ({len(embeddings)}) must match text_chunks length ({len(text_chunks)})",
+                    argument_name="embeddings",
+                )
+            # check if first non-empty embedding has correct dimensions
+            filtered_indices = [i for i, _ in filtered_chunks]
+            sample_embedding = embeddings[filtered_indices[0]] if filtered_indices else None
+            if sample_embedding is not None and len(sample_embedding) == self.default_embedding_config.embedding_dim:
+                use_provided_embeddings = True
+                filtered_embeddings = [embeddings[i] for i, _ in filtered_chunks]
+            else:
+                logger.debug(
+                    f"Embedding dimension mismatch (got {len(sample_embedding) if sample_embedding else 'None'}, "
+                    f"expected {self.default_embedding_config.embedding_dim}), regenerating embeddings"
+                )
+
+        if not use_provided_embeddings:
+            filtered_embeddings = await self._generate_embeddings(filtered_texts, actor)
 
         namespace_name = await self._get_archive_namespace_name(archive_id)
 
@@ -172,7 +577,7 @@ class TurbopufferClient:
         tags_arrays = []  # Store tags as arrays
         passages = []
 
-        for (original_idx, text), embedding in zip(filtered_chunks, embeddings):
+        for (original_idx, text), embedding in zip(filtered_chunks, filtered_embeddings):
             passage_id = passage_ids[original_idx]
 
             # append to columns
@@ -210,19 +615,20 @@ class TurbopufferClient:
         }
 
         try:
-            # use global semaphore to limit concurrent Turbopuffer writes
+            # Use global semaphore to limit concurrent Turbopuffer writes
             async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
-                # Use AsyncTurbopuffer as a context manager for proper resource cleanup
-                async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                    namespace = client.namespace(namespace_name)
-                    # turbopuffer recommends column-based writes for performance
-                    await namespace.write(
-                        upsert_columns=upsert_columns,
-                        distance_metric="cosine_distance",
-                        schema={"text": {"type": "string", "full_text_search": True}},
-                    )
-                    logger.info(f"Successfully inserted {len(ids)} passages to Turbopuffer for archive {archive_id}")
-                    return passages
+                # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                await asyncio.to_thread(
+                    _run_turbopuffer_write_in_thread,
+                    api_key=self.api_key,
+                    region=self.region,
+                    namespace_name=namespace_name,
+                    upsert_columns=upsert_columns,
+                    distance_metric="cosine_distance",
+                    schema={"text": {"type": "string", "full_text_search": True}},
+                )
+                logger.info(f"Successfully inserted {len(ids)} passages to Turbopuffer for archive {archive_id}")
+                return passages
 
         except Exception as e:
             logger.error(f"Failed to insert passages to Turbopuffer: {e}")
@@ -232,6 +638,7 @@ class TurbopufferClient:
             raise
 
     @trace_method
+    @async_retry_with_backoff()
     async def insert_messages(
         self,
         agent_id: str,
@@ -243,6 +650,7 @@ class TurbopufferClient:
         created_ats: List[datetime],
         project_id: Optional[str] = None,
         template_id: Optional[str] = None,
+        conversation_ids: Optional[List[Optional[str]]] = None,
     ) -> bool:
         """Insert messages into Turbopuffer.
 
@@ -256,11 +664,11 @@ class TurbopufferClient:
             created_ats: List of creation timestamps for each message
             project_id: Optional project ID for all messages
             template_id: Optional template ID for all messages
+            conversation_ids: Optional list of conversation IDs (one per message, must match 1:1 with message_texts)
 
         Returns:
             True if successful
         """
-        from turbopuffer import AsyncTurbopuffer
 
         # filter out empty message texts
         filtered_messages = [(i, text) for i, text in enumerate(message_texts) if text.strip()]
@@ -284,22 +692,27 @@ class TurbopufferClient:
             raise ValueError(f"message_ids length ({len(message_ids)}) must match roles length ({len(roles)})")
         if len(message_ids) != len(created_ats):
             raise ValueError(f"message_ids length ({len(message_ids)}) must match created_ats length ({len(created_ats)})")
+        if conversation_ids is not None and len(conversation_ids) != len(message_ids):
+            raise ValueError(f"conversation_ids length ({len(conversation_ids)}) must match message_ids length ({len(message_ids)})")
 
         # prepare column-based data for turbopuffer - optimized for batch insert
         ids = []
         vectors = []
         texts = []
-        organization_ids = []
-        agent_ids = []
+        organization_ids_list = []
+        agent_ids_list = []
         message_roles = []
         created_at_timestamps = []
-        project_ids = []
-        template_ids = []
+        project_ids_list = []
+        template_ids_list = []
+        conversation_ids_list = []
+        is_deleted_list = []
 
         for (original_idx, text), embedding in zip(filtered_messages, embeddings):
             message_id = message_ids[original_idx]
             role = roles[original_idx]
             created_at = created_ats[original_idx]
+            conversation_id = conversation_ids[original_idx] if conversation_ids else None
 
             # ensure the provided timestamp is timezone-aware and in UTC
             if created_at.tzinfo is None:
@@ -313,46 +726,58 @@ class TurbopufferClient:
             ids.append(message_id)
             vectors.append(embedding)
             texts.append(text)
-            organization_ids.append(organization_id)
-            agent_ids.append(agent_id)
+            organization_ids_list.append(organization_id)
+            agent_ids_list.append(agent_id)
             message_roles.append(role.value)
             created_at_timestamps.append(timestamp)
-            project_ids.append(project_id)
-            template_ids.append(template_id)
+            project_ids_list.append(project_id)
+            template_ids_list.append(template_id)
+            conversation_ids_list.append(conversation_id)
+            is_deleted_list.append(False)
 
         # build column-based upsert data
         upsert_columns = {
             "id": ids,
             "vector": vectors,
             "text": texts,
-            "organization_id": organization_ids,
-            "agent_id": agent_ids,
+            "organization_id": organization_ids_list,
+            "agent_id": agent_ids_list,
             "role": message_roles,
             "created_at": created_at_timestamps,
+            "is_deleted": is_deleted_list,
         }
+
+        # only include conversation_id if it's provided
+        if conversation_ids is not None:
+            upsert_columns["conversation_id"] = conversation_ids_list
 
         # only include project_id if it's provided
         if project_id is not None:
-            upsert_columns["project_id"] = project_ids
+            upsert_columns["project_id"] = project_ids_list
 
         # only include template_id if it's provided
         if template_id is not None:
-            upsert_columns["template_id"] = template_ids
+            upsert_columns["template_id"] = template_ids_list
 
         try:
-            # use global semaphore to limit concurrent Turbopuffer writes
+            # Use global semaphore to limit concurrent Turbopuffer writes
             async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
-                # Use AsyncTurbopuffer as a context manager for proper resource cleanup
-                async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                    namespace = client.namespace(namespace_name)
-                    # turbopuffer recommends column-based writes for performance
-                    await namespace.write(
-                        upsert_columns=upsert_columns,
-                        distance_metric="cosine_distance",
-                        schema={"text": {"type": "string", "full_text_search": True}},
-                    )
-                    logger.info(f"Successfully inserted {len(ids)} messages to Turbopuffer for agent {agent_id}")
-                    return True
+                # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                await asyncio.to_thread(
+                    _run_turbopuffer_write_in_thread,
+                    api_key=self.api_key,
+                    region=self.region,
+                    namespace_name=namespace_name,
+                    upsert_columns=upsert_columns,
+                    distance_metric="cosine_distance",
+                    schema={
+                        "text": {"type": "string", "full_text_search": True},
+                        "conversation_id": {"type": "string"},
+                        "is_deleted": {"type": "bool"},
+                    },
+                )
+                logger.info(f"Successfully inserted {len(ids)} messages to Turbopuffer for agent {agent_id}")
+                return True
 
         except Exception as e:
             logger.error(f"Failed to insert messages to Turbopuffer: {e}")
@@ -362,6 +787,7 @@ class TurbopufferClient:
             raise
 
     @trace_method
+    @async_retry_with_backoff()
     async def _execute_query(
         self,
         namespace_name: str,
@@ -404,67 +830,80 @@ class TurbopufferClient:
         if search_mode not in ["vector", "fts", "hybrid", "timestamp"]:
             raise ValueError(f"Invalid search_mode: {search_mode}. Must be 'vector', 'fts', 'hybrid', or 'timestamp'")
 
-        async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-            namespace = client.namespace(namespace_name)
+        try:
+            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
+                namespace = client.namespace(namespace_name)
 
-            if search_mode == "timestamp":
-                # retrieve most recent items by timestamp
-                query_params = {
-                    "rank_by": ("created_at", "desc"),
-                    "top_k": top_k,
-                    "include_attributes": include_attributes,
-                }
-                if filters:
-                    query_params["filters"] = filters
-                return await namespace.query(**query_params)
+                if search_mode == "timestamp":
+                    # retrieve most recent items by timestamp
+                    query_params = {
+                        "rank_by": ("created_at", "desc"),
+                        "top_k": top_k,
+                        "include_attributes": include_attributes,
+                    }
+                    if filters:
+                        query_params["filters"] = filters
+                    return await namespace.query(**query_params)
 
-            elif search_mode == "vector":
-                # vector search query
-                query_params = {
-                    "rank_by": ("vector", "ANN", query_embedding),
-                    "top_k": top_k,
-                    "include_attributes": include_attributes,
-                }
-                if filters:
-                    query_params["filters"] = filters
-                return await namespace.query(**query_params)
+                elif search_mode == "vector":
+                    # vector search query
+                    query_params = {
+                        "rank_by": ("vector", "ANN", query_embedding),
+                        "top_k": top_k,
+                        "include_attributes": include_attributes,
+                    }
+                    if filters:
+                        query_params["filters"] = filters
+                    return await namespace.query(**query_params)
 
-            elif search_mode == "fts":
-                # full-text search query
-                query_params = {
-                    "rank_by": ("text", "BM25", query_text),
-                    "top_k": top_k,
-                    "include_attributes": include_attributes,
-                }
-                if filters:
-                    query_params["filters"] = filters
-                return await namespace.query(**query_params)
+                elif search_mode == "fts":
+                    # full-text search query
+                    query_params = {
+                        "rank_by": ("text", "BM25", query_text),
+                        "top_k": top_k,
+                        "include_attributes": include_attributes,
+                    }
+                    if filters:
+                        query_params["filters"] = filters
+                    return await namespace.query(**query_params)
 
-            else:  # hybrid mode
-                queries = []
+                else:  # hybrid mode
+                    queries = []
 
-                # vector search query
-                vector_query = {
-                    "rank_by": ("vector", "ANN", query_embedding),
-                    "top_k": top_k,
-                    "include_attributes": include_attributes,
-                }
-                if filters:
-                    vector_query["filters"] = filters
-                queries.append(vector_query)
+                    # vector search query
+                    vector_query = {
+                        "rank_by": ("vector", "ANN", query_embedding),
+                        "top_k": top_k,
+                        "include_attributes": include_attributes,
+                    }
+                    if filters:
+                        vector_query["filters"] = filters
+                    queries.append(vector_query)
 
-                # full-text search query
-                fts_query = {
-                    "rank_by": ("text", "BM25", query_text),
-                    "top_k": top_k,
-                    "include_attributes": include_attributes,
-                }
-                if filters:
-                    fts_query["filters"] = filters
-                queries.append(fts_query)
+                    # full-text search query
+                    fts_query = {
+                        "rank_by": ("text", "BM25", query_text),
+                        "top_k": top_k,
+                        "include_attributes": include_attributes,
+                    }
+                    if filters:
+                        fts_query["filters"] = filters
+                    queries.append(fts_query)
 
-                # execute multi-query
-                return await namespace.multi_query(queries=[QueryParam(**q) for q in queries])
+                    # execute multi-query
+                    return await namespace.multi_query(queries=[QueryParam(**q) for q in queries])
+        except Exception as e:
+            # Wrap turbopuffer errors with user-friendly messages
+            from turbopuffer import NotFoundError
+
+            if isinstance(e, NotFoundError):
+                # Extract just the error message without implementation details
+                error_msg = str(e)
+                if "namespace" in error_msg.lower() and "not found" in error_msg.lower():
+                    raise ValueError("No conversation history found. Please send a message first to enable search.") from e
+                raise ValueError(f"Search data not found: {error_msg}") from e
+            # Re-raise other errors as-is
+            raise
 
     @trace_method
     async def query_passages(
@@ -531,6 +970,9 @@ class TurbopufferClient:
         # build date filter conditions
         date_filters = []
         if start_date:
+            # Convert to UTC to match stored timestamps
+            if start_date.tzinfo is not None:
+                start_date = start_date.astimezone(timezone.utc)
             date_filters.append(("created_at", "Gte", start_date))
         if end_date:
             # if end_date has no time component (is at midnight), adjust to end of day
@@ -540,6 +982,9 @@ class TurbopufferClient:
 
                 # add 1 day and subtract 1 microsecond to get 23:59:59.999999
                 end_date = end_date + timedelta(days=1) - timedelta(microseconds=1)
+            # Convert to UTC to match stored timestamps
+            if end_date.tzinfo is not None:
+                end_date = end_date.astimezone(timezone.utc)
             date_filters.append(("created_at", "Lte", end_date))
 
         # combine all filters
@@ -605,6 +1050,9 @@ class TurbopufferClient:
             raise
 
     @trace_method
+    # TODO: Once existing TPUF namespaces are backfilled with is_deleted attribute,
+    # add is_deleted=False filter to query_messages_by_agent_id and query_messages_by_org_id.
+    # Until then, soft-deleted messages are filtered out via DB post-filter in MessageManager.search_messages_async.
     async def query_messages_by_agent_id(
         self,
         agent_id: str,
@@ -616,6 +1064,7 @@ class TurbopufferClient:
         roles: Optional[List[MessageRole]] = None,
         project_id: Optional[str] = None,
         template_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
         vector_weight: float = 0.5,
         fts_weight: float = 0.5,
         start_date: Optional[datetime] = None,
@@ -633,6 +1082,7 @@ class TurbopufferClient:
             roles: Optional list of message roles to filter by
             project_id: Optional project ID to filter messages by
             template_id: Optional template ID to filter messages by
+            conversation_id: Optional conversation ID to filter messages by (use "default" for NULL)
             vector_weight: Weight for vector search results in hybrid mode (default: 0.5)
             fts_weight: Weight for FTS results in hybrid mode (default: 0.5)
             start_date: Optional datetime to filter messages created after this date
@@ -672,6 +1122,9 @@ class TurbopufferClient:
         # build date filter conditions
         date_filters = []
         if start_date:
+            # Convert to UTC to match stored timestamps
+            if start_date.tzinfo is not None:
+                start_date = start_date.astimezone(timezone.utc)
             date_filters.append(("created_at", "Gte", start_date))
         if end_date:
             # if end_date has no time component (is at midnight), adjust to end of day
@@ -681,6 +1134,9 @@ class TurbopufferClient:
 
                 # add 1 day and subtract 1 microsecond to get 23:59:59.999999
                 end_date = end_date + timedelta(days=1) - timedelta(microseconds=1)
+            # Convert to UTC to match stored timestamps
+            if end_date.tzinfo is not None:
+                end_date = end_date.astimezone(timezone.utc)
             date_filters.append(("created_at", "Lte", end_date))
 
         # build project_id filter if provided
@@ -693,6 +1149,19 @@ class TurbopufferClient:
         if template_id:
             template_filter = ("template_id", "Eq", template_id)
 
+        # build conversation_id filter if provided
+        # three cases:
+        # 1. conversation_id=None (omitted) -> return all messages (no filter)
+        # 2. conversation_id="default" -> return only default messages (conversation_id is none), for backward compatibility
+        # 3. conversation_id="xyz" -> return only messages in that conversation
+        conversation_filter = None
+        if conversation_id == "default":
+            # "default" is reserved for default messages only (conversation_id is none)
+            conversation_filter = ("conversation_id", "Eq", None)
+        elif conversation_id is not None:
+            # Specific conversation
+            conversation_filter = ("conversation_id", "Eq", conversation_id)
+
         # combine all filters
         all_filters = [agent_filter]  # always include agent_id filter
         if role_filter:
@@ -701,6 +1170,8 @@ class TurbopufferClient:
             all_filters.append(project_filter)
         if template_filter:
             all_filters.append(template_filter)
+        if conversation_filter:
+            all_filters.append(conversation_filter)
         if date_filters:
             all_filters.extend(date_filters)
 
@@ -719,7 +1190,7 @@ class TurbopufferClient:
                 query_embedding=query_embedding,
                 query_text=query_text,
                 top_k=top_k,
-                include_attributes=["text", "organization_id", "agent_id", "role", "created_at"],
+                include_attributes=True,
                 filters=final_filter,
                 vector_weight=vector_weight,
                 fts_weight=fts_weight,
@@ -770,6 +1241,7 @@ class TurbopufferClient:
         agent_id: Optional[str] = None,
         project_id: Optional[str] = None,
         template_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
         vector_weight: float = 0.5,
         fts_weight: float = 0.5,
         start_date: Optional[datetime] = None,
@@ -787,6 +1259,10 @@ class TurbopufferClient:
             agent_id: Optional agent ID to filter messages by
             project_id: Optional project ID to filter messages by
             template_id: Optional template ID to filter messages by
+            conversation_id: Optional conversation ID to filter messages by. Special values:
+                - None (omitted): Return all messages
+                - "default": Return only default messages (conversation_id IS NULL)
+                - Any other value: Return messages in that specific conversation
             vector_weight: Weight for vector search results in hybrid mode (default: 0.5)
             fts_weight: Weight for FTS results in hybrid mode (default: 0.5)
             start_date: Optional datetime to filter messages created after this date
@@ -803,6 +1279,12 @@ class TurbopufferClient:
         if query_text and search_mode in ["vector", "hybrid"]:
             embeddings = await self._generate_embeddings([query_text], actor)
             query_embedding = embeddings[0]
+
+        # Check if we should fallback to timestamp-based retrieval
+        if query_embedding is None and query_text is None and search_mode not in ["timestamp"]:
+            # Fallback to retrieving most recent messages when no search query is provided
+            search_mode = "timestamp"
+
         # namespace is org-scoped
         namespace_name = await self._get_message_namespace_name(organization_id)
 
@@ -829,8 +1311,23 @@ class TurbopufferClient:
         if template_id:
             all_filters.append(("template_id", "Eq", template_id))
 
+        # conversation filter
+        # three cases:
+        # 1. conversation_id=None (omitted) -> return all messages (no filter)
+        # 2. conversation_id="default" -> return only default messages (conversation_id is none), for backward compatibility
+        # 3. conversation_id="xyz" -> return only messages in that conversation
+        if conversation_id == "default":
+            # "default" is reserved for default messages only (conversation_id is none)
+            all_filters.append(("conversation_id", "Eq", None))
+        elif conversation_id is not None:
+            # Specific conversation
+            all_filters.append(("conversation_id", "Eq", conversation_id))
+
         # date filters
         if start_date:
+            # Convert to UTC to match stored timestamps
+            if start_date.tzinfo is not None:
+                start_date = start_date.astimezone(timezone.utc)
             all_filters.append(("created_at", "Gte", start_date))
         if end_date:
             # make end_date inclusive of the entire day
@@ -838,6 +1335,9 @@ class TurbopufferClient:
                 from datetime import timedelta
 
                 end_date = end_date + timedelta(days=1) - timedelta(microseconds=1)
+            # Convert to UTC to match stored timestamps
+            if end_date.tzinfo is not None:
+                end_date = end_date.astimezone(timezone.utc)
             all_filters.append(("created_at", "Lte", end_date))
 
         # combine filters
@@ -855,7 +1355,7 @@ class TurbopufferClient:
                 query_embedding=query_embedding,
                 query_text=query_text,
                 top_k=top_k,
-                include_attributes=["text", "organization_id", "agent_id", "role", "created_at"],
+                include_attributes=True,
                 filters=final_filter,
                 vector_weight=vector_weight,
                 fts_weight=fts_weight,
@@ -940,6 +1440,7 @@ class TurbopufferClient:
                 "agent_id": getattr(row, "agent_id", None),
                 "role": getattr(row, "role", None),
                 "created_at": getattr(row, "created_at", None),
+                "conversation_id": getattr(row, "conversation_id", None),
             }
             messages.append(message_dict)
 
@@ -1058,27 +1559,31 @@ class TurbopufferClient:
         return sorted_results[:top_k]
 
     @trace_method
+    @async_retry_with_backoff()
     async def delete_passage(self, archive_id: str, passage_id: str) -> bool:
         """Delete a passage from Turbopuffer."""
-        from turbopuffer import AsyncTurbopuffer
 
         namespace_name = await self._get_archive_namespace_name(archive_id)
 
         try:
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # Use write API with deletes parameter as per Turbopuffer docs
-                await namespace.write(deletes=[passage_id])
-                logger.info(f"Successfully deleted passage {passage_id} from Turbopuffer archive {archive_id}")
-                return True
+            # Run in thread pool for consistency (deletes are lightweight but use same wrapper)
+            await asyncio.to_thread(
+                _run_turbopuffer_write_in_thread,
+                api_key=self.api_key,
+                region=self.region,
+                namespace_name=namespace_name,
+                deletes=[passage_id],
+            )
+            logger.info(f"Successfully deleted passage {passage_id} from Turbopuffer archive {archive_id}")
+            return True
         except Exception as e:
             logger.error(f"Failed to delete passage from Turbopuffer: {e}")
             raise
 
     @trace_method
+    @async_retry_with_backoff()
     async def delete_passages(self, archive_id: str, passage_ids: List[str]) -> bool:
         """Delete multiple passages from Turbopuffer."""
-        from turbopuffer import AsyncTurbopuffer
 
         if not passage_ids:
             return True
@@ -1086,17 +1591,22 @@ class TurbopufferClient:
         namespace_name = await self._get_archive_namespace_name(archive_id)
 
         try:
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # Use write API with deletes parameter as per Turbopuffer docs
-                await namespace.write(deletes=passage_ids)
-                logger.info(f"Successfully deleted {len(passage_ids)} passages from Turbopuffer archive {archive_id}")
-                return True
+            # Run in thread pool for consistency
+            await asyncio.to_thread(
+                _run_turbopuffer_write_in_thread,
+                api_key=self.api_key,
+                region=self.region,
+                namespace_name=namespace_name,
+                deletes=passage_ids,
+            )
+            logger.info(f"Successfully deleted {len(passage_ids)} passages from Turbopuffer archive {archive_id}")
+            return True
         except Exception as e:
             logger.error(f"Failed to delete passages from Turbopuffer: {e}")
             raise
 
     @trace_method
+    @async_retry_with_backoff()
     async def delete_all_passages(self, archive_id: str) -> bool:
         """Delete all passages for an archive from Turbopuffer."""
         from turbopuffer import AsyncTurbopuffer
@@ -1115,9 +1625,9 @@ class TurbopufferClient:
             raise
 
     @trace_method
+    @async_retry_with_backoff()
     async def delete_messages(self, agent_id: str, organization_id: str, message_ids: List[str]) -> bool:
         """Delete multiple messages from Turbopuffer."""
-        from turbopuffer import AsyncTurbopuffer
 
         if not message_ids:
             return True
@@ -1125,31 +1635,38 @@ class TurbopufferClient:
         namespace_name = await self._get_message_namespace_name(organization_id)
 
         try:
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # Use write API with deletes parameter as per Turbopuffer docs
-                await namespace.write(deletes=message_ids)
-                logger.info(f"Successfully deleted {len(message_ids)} messages from Turbopuffer for agent {agent_id}")
-                return True
+            # Run in thread pool for consistency
+            await asyncio.to_thread(
+                _run_turbopuffer_write_in_thread,
+                api_key=self.api_key,
+                region=self.region,
+                namespace_name=namespace_name,
+                deletes=message_ids,
+            )
+            logger.info(f"Successfully deleted {len(message_ids)} messages from Turbopuffer for agent {agent_id}")
+            return True
         except Exception as e:
             logger.error(f"Failed to delete messages from Turbopuffer: {e}")
             raise
 
     @trace_method
+    @async_retry_with_backoff()
     async def delete_all_messages(self, agent_id: str, organization_id: str) -> bool:
         """Delete all messages for an agent from Turbopuffer."""
-        from turbopuffer import AsyncTurbopuffer
 
         namespace_name = await self._get_message_namespace_name(organization_id)
 
         try:
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # Use delete_by_filter to only delete messages for this agent
-                # since namespace is now org-scoped
-                result = await namespace.write(delete_by_filter=("agent_id", "Eq", agent_id))
-                logger.info(f"Successfully deleted all messages for agent {agent_id} (deleted {result.rows_affected} rows)")
-                return True
+            # Run in thread pool for consistency
+            result = await asyncio.to_thread(
+                _run_turbopuffer_write_in_thread,
+                api_key=self.api_key,
+                region=self.region,
+                namespace_name=namespace_name,
+                delete_by_filter=("agent_id", "Eq", agent_id),
+            )
+            logger.info(f"Successfully deleted all messages for agent {agent_id} (deleted {result.rows_affected if result else 0} rows)")
+            return True
         except Exception as e:
             logger.error(f"Failed to delete all messages from Turbopuffer: {e}")
             raise
@@ -1175,6 +1692,7 @@ class TurbopufferClient:
         return namespace_name
 
     @trace_method
+    @async_retry_with_backoff()
     async def insert_file_passages(
         self,
         source_id: str,
@@ -1197,7 +1715,6 @@ class TurbopufferClient:
         Returns:
             List of PydanticPassage objects that were inserted
         """
-        from turbopuffer import AsyncTurbopuffer
 
         if not text_chunks:
             return []
@@ -1268,19 +1785,20 @@ class TurbopufferClient:
         }
 
         try:
-            # use global semaphore to limit concurrent Turbopuffer writes
+            # Use global semaphore to limit concurrent Turbopuffer writes
             async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
-                # use AsyncTurbopuffer as a context manager for proper resource cleanup
-                async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                    namespace = client.namespace(namespace_name)
-                    # turbopuffer recommends column-based writes for performance
-                    await namespace.write(
-                        upsert_columns=upsert_columns,
-                        distance_metric="cosine_distance",
-                        schema={"text": {"type": "string", "full_text_search": True}},
-                    )
-                    logger.info(f"Successfully inserted {len(ids)} file passages to Turbopuffer for source {source_id}, file {file_id}")
-                    return passages
+                # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                await asyncio.to_thread(
+                    _run_turbopuffer_write_in_thread,
+                    api_key=self.api_key,
+                    region=self.region,
+                    namespace_name=namespace_name,
+                    upsert_columns=upsert_columns,
+                    distance_metric="cosine_distance",
+                    schema={"text": {"type": "string", "full_text_search": True}},
+                )
+                logger.info(f"Successfully inserted {len(ids)} file passages to Turbopuffer for source {source_id}, file {file_id}")
+                return passages
 
         except Exception as e:
             logger.error(f"Failed to insert file passages to Turbopuffer: {e}")
@@ -1430,41 +1948,203 @@ class TurbopufferClient:
         return passages_with_scores
 
     @trace_method
+    @async_retry_with_backoff()
     async def delete_file_passages(self, source_id: str, file_id: str, organization_id: str) -> bool:
         """Delete all passages for a specific file from Turbopuffer."""
-        from turbopuffer import AsyncTurbopuffer
 
         namespace_name = await self._get_file_passages_namespace_name(organization_id)
 
         try:
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # use delete_by_filter to only delete passages for this file
-                # need to filter by both source_id and file_id
-                filter_expr = ("And", [("source_id", "Eq", source_id), ("file_id", "Eq", file_id)])
-                result = await namespace.write(delete_by_filter=filter_expr)
-                logger.info(
-                    f"Successfully deleted passages for file {file_id} from source {source_id} (deleted {result.rows_affected} rows)"
-                )
-                return True
+            # use delete_by_filter to only delete passages for this file
+            # need to filter by both source_id and file_id
+            filter_expr = ("And", [("source_id", "Eq", source_id), ("file_id", "Eq", file_id)])
+
+            # Run in thread pool for consistency
+            result = await asyncio.to_thread(
+                _run_turbopuffer_write_in_thread,
+                api_key=self.api_key,
+                region=self.region,
+                namespace_name=namespace_name,
+                delete_by_filter=filter_expr,
+            )
+            logger.info(
+                f"Successfully deleted passages for file {file_id} from source {source_id} (deleted {result.rows_affected if result else 0} rows)"
+            )
+            return True
         except Exception as e:
             logger.error(f"Failed to delete file passages from Turbopuffer: {e}")
             raise
 
     @trace_method
+    @async_retry_with_backoff()
     async def delete_source_passages(self, source_id: str, organization_id: str) -> bool:
         """Delete all passages for a source from Turbopuffer."""
-        from turbopuffer import AsyncTurbopuffer
 
         namespace_name = await self._get_file_passages_namespace_name(organization_id)
 
         try:
-            async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
-                namespace = client.namespace(namespace_name)
-                # delete all passages for this source
-                result = await namespace.write(delete_by_filter=("source_id", "Eq", source_id))
-                logger.info(f"Successfully deleted all passages for source {source_id} (deleted {result.rows_affected} rows)")
-                return True
+            # Run in thread pool for consistency
+            result = await asyncio.to_thread(
+                _run_turbopuffer_write_in_thread,
+                api_key=self.api_key,
+                region=self.region,
+                namespace_name=namespace_name,
+                delete_by_filter=("source_id", "Eq", source_id),
+            )
+            logger.info(f"Successfully deleted all passages for source {source_id} (deleted {result.rows_affected if result else 0} rows)")
+            return True
         except Exception as e:
             logger.error(f"Failed to delete source passages from Turbopuffer: {e}")
             raise
+
+    # tool methods
+
+    @trace_method
+    @async_retry_with_backoff()
+    async def delete_tools(self, organization_id: str, tool_ids: List[str]) -> bool:
+        """Delete tools from Turbopuffer.
+
+        Args:
+            organization_id: Organization ID for namespace lookup
+            tool_ids: List of tool IDs to delete
+
+        Returns:
+            True if successful
+        """
+
+        if not tool_ids:
+            return True
+
+        namespace_name = await self._get_tool_namespace_name(organization_id)
+
+        try:
+            # Run in thread pool for consistency
+            await asyncio.to_thread(
+                _run_turbopuffer_write_in_thread,
+                api_key=self.api_key,
+                region=self.region,
+                namespace_name=namespace_name,
+                deletes=tool_ids,
+            )
+            logger.info(f"Successfully deleted {len(tool_ids)} tools from Turbopuffer")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete tools from Turbopuffer: {e}")
+            raise
+
+    @trace_method
+    async def query_tools(
+        self,
+        organization_id: str,
+        actor: "PydanticUser",
+        query_text: Optional[str] = None,
+        search_mode: str = "hybrid",  # "vector", "fts", "hybrid", "timestamp"
+        top_k: int = 50,
+        tool_types: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        vector_weight: float = 0.5,
+        fts_weight: float = 0.5,
+    ) -> List[Tuple[dict, float, dict]]:
+        """Query tools from Turbopuffer using semantic search.
+
+        Args:
+            organization_id: Organization ID for namespace lookup
+            actor: User actor for embedding generation
+            query_text: Text query for search
+            search_mode: Search mode - "vector", "fts", "hybrid", or "timestamp"
+            top_k: Number of results to return
+            tool_types: Optional list of tool types to filter by
+            tags: Optional list of tags to filter by (match any)
+            vector_weight: Weight for vector search in hybrid mode
+            fts_weight: Weight for FTS in hybrid mode
+
+        Returns:
+            List of (tool_dict, score, metadata) tuples
+        """
+        # Generate embedding for vector/hybrid search
+        query_embedding = None
+        if query_text and search_mode in ["vector", "hybrid"]:
+            embeddings = await self._generate_embeddings([query_text], actor)
+            query_embedding = embeddings[0] if embeddings else None
+
+        # Fallback to timestamp-based retrieval when no query
+        if query_embedding is None and query_text is None and search_mode not in ["timestamp"]:
+            search_mode = "timestamp"
+
+        namespace_name = await self._get_tool_namespace_name(organization_id)
+
+        # Build filters
+        all_filters = []
+
+        if tool_types:
+            if len(tool_types) == 1:
+                all_filters.append(("tool_type", "Eq", tool_types[0]))
+            else:
+                all_filters.append(("tool_type", "In", tool_types))
+
+        if tags:
+            all_filters.append(("tags", "ContainsAny", tags))
+
+        # Combine filters
+        final_filter = None
+        if len(all_filters) == 1:
+            final_filter = all_filters[0]
+        elif len(all_filters) > 1:
+            final_filter = ("And", all_filters)
+
+        try:
+            result = await self._execute_query(
+                namespace_name=namespace_name,
+                search_mode=search_mode,
+                query_embedding=query_embedding,
+                query_text=query_text,
+                top_k=top_k,
+                include_attributes=["text", "name", "organization_id", "tool_type", "tags", "created_at"],
+                filters=final_filter,
+                vector_weight=vector_weight,
+                fts_weight=fts_weight,
+            )
+
+            if search_mode == "hybrid":
+                vector_results = self._process_tool_query_results(result.results[0])
+                fts_results = self._process_tool_query_results(result.results[1])
+                results_with_metadata = self._reciprocal_rank_fusion(
+                    vector_results=vector_results,
+                    fts_results=fts_results,
+                    get_id_func=lambda d: d["id"],
+                    vector_weight=vector_weight,
+                    fts_weight=fts_weight,
+                    top_k=top_k,
+                )
+                return results_with_metadata
+            else:
+                results = self._process_tool_query_results(result)
+                results_with_metadata = []
+                for idx, tool_dict in enumerate(results):
+                    metadata = {
+                        "combined_score": 1.0 / (idx + 1),
+                        "search_mode": search_mode,
+                        f"{search_mode}_rank": idx + 1,
+                    }
+                    results_with_metadata.append((tool_dict, metadata["combined_score"], metadata))
+                return results_with_metadata
+
+        except Exception as e:
+            logger.error(f"Failed to query tools from Turbopuffer: {e}")
+            raise
+
+    def _process_tool_query_results(self, result) -> List[dict]:
+        """Process results from a tool query into tool dicts."""
+        tools = []
+        for row in result.rows:
+            tool_dict = {
+                "id": row.id,
+                "text": getattr(row, "text", ""),
+                "name": getattr(row, "name", ""),
+                "organization_id": getattr(row, "organization_id", None),
+                "tool_type": getattr(row, "tool_type", None),
+                "tags": getattr(row, "tags", []),
+                "created_at": getattr(row, "created_at", None),
+            }
+            tools.append(tool_dict)
+        return tools

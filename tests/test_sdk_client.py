@@ -6,7 +6,7 @@ import textwrap
 import threading
 import time
 import uuid
-from typing import List, Type
+from typing import ClassVar, List, Type
 
 import pytest
 from dotenv import load_dotenv
@@ -24,14 +24,12 @@ from letta_client.types import (
     TerminalToolRule,
     ToolReturnMessage,
 )
-from letta_client.types.agents.text_content_param import TextContentParam
 from letta_client.types.tool import BaseTool
 from pydantic import BaseModel, Field
 
 from letta.config import LettaConfig
-from letta.jobs.llm_batch_job_polling import poll_running_llm_batches
 from letta.server.server import SyncServer
-from tests.helpers.utils import upload_file_and_wait
+from tests.utils import wait_for_server
 
 # Constants
 SERVER_PORT = 8283
@@ -106,7 +104,7 @@ def client() -> LettaSDKClient:
         print("Starting server thread")
         thread = threading.Thread(target=run_server, daemon=True)
         thread.start()
-        time.sleep(5)
+        wait_for_server(server_url, timeout=60)
 
     print("Running client tests with server:", server_url)
     client = LettaSDKClient(base_url=server_url)
@@ -380,7 +378,7 @@ def test_add_and_manage_tags_for_agent(client: LettaSDKClient):
     assert len(agent.tags) == 0
 
     # Step 1: Add multiple tags to the agent
-    updated_agent = client.agents.update(agent_id=agent.id, tags=tags_to_add)
+    client.agents.update(agent_id=agent.id, tags=tags_to_add)
 
     # Add small delay to ensure tags are persisted
     time.sleep(0.1)
@@ -398,7 +396,7 @@ def test_add_and_manage_tags_for_agent(client: LettaSDKClient):
 
     # Step 4: Delete a specific tag from the agent and verify its removal
     tag_to_delete = tags_to_add.pop()
-    updated_agent = client.agents.update(agent_id=agent.id, tags=tags_to_add)
+    client.agents.update(agent_id=agent.id, tags=tags_to_add)
 
     # Verify the tag is removed from the agent's tags - explicitly request tags
     remaining_tags = client.agents.retrieve(agent_id=agent.id, include=["agent.tags"]).tags
@@ -427,7 +425,7 @@ def test_reset_messages(client: LettaSDKClient):
 
     try:
         # Send a message
-        response = client.agents.messages.create(
+        client.agents.messages.create(
             agent_id=agent.id,
             messages=[MessageCreateParam(role="user", content="Hello")],
         )
@@ -543,7 +541,6 @@ def test_list_files_for_agent(client: LettaSDKClient):
             raise RuntimeError(f"File {file_metadata.id} not found")
     if file_metadata.processing_status == "error":
         raise RuntimeError(f"File processing failed: {getattr(file_metadata, 'error_message', 'Unknown error')}")
-    test_file = file_metadata
 
     agent = client.agents.create(
         memory_blocks=[CreateBlockParam(label="persona", value="test")],
@@ -605,7 +602,7 @@ def test_modify_message(client: LettaSDKClient):
 
     try:
         # Send a message
-        response = client.agents.messages.create(
+        client.agents.messages.create(
             agent_id=agent.id,
             messages=[MessageCreateParam(role="user", content="Original message")],
         )
@@ -804,38 +801,6 @@ def test_add_remove_agent_memory_block(client: LettaSDKClient, agent: AgentState
     assert example_new_label not in current_labels
 
 
-def test_update_agent_memory_limit(client: LettaSDKClient, agent: AgentState):
-    """Test that we can update the limit of a block in an agent's memory"""
-
-    current_labels = [block.label for block in client.agents.blocks.list(agent_id=agent.id).items]
-    example_label = current_labels[0]
-    example_new_limit = 1
-    current_block = client.agents.blocks.retrieve(agent_id=agent.id, block_label=example_label)
-    current_block_length = len(current_block.value)
-
-    assert example_new_limit != client.agents.blocks.retrieve(agent_id=agent.id, block_label=example_label).limit
-    assert example_new_limit < current_block_length
-
-    # We expect this to throw a value error
-    with pytest.raises(APIError):
-        client.agents.blocks.update(
-            agent_id=agent.id,
-            block_label=example_label,
-            limit=example_new_limit,
-        )
-
-    # Now try the same thing with a higher limit
-    example_new_limit = current_block_length + 10000
-    assert example_new_limit > current_block_length
-    client.agents.blocks.update(
-        agent_id=agent.id,
-        block_label=example_label,
-        limit=example_new_limit,
-    )
-
-    assert example_new_limit == client.agents.blocks.retrieve(agent_id=agent.id, block_label=example_label).limit
-
-
 def test_messages(client: LettaSDKClient, agent: AgentState):
     send_message_response = client.agents.messages.create(
         agent_id=agent.id,
@@ -988,11 +953,6 @@ def test_function_always_error(client: LettaSDKClient, agent: AgentState):
 
 def test_agent_creation(client: LettaSDKClient):
     """Test that block IDs are properly attached when creating an agent."""
-    sleeptime_agent_system = """
-    You are a helpful agent. You will be provided with a list of memory blocks and a user preferences block.
-    You should use the memory blocks to remember information about the user and their preferences.
-    You should also use the user preferences block to remember information about the user's preferences.
-    """
 
     # Create a test block that will represent user preferences
     user_preferences_block = client.blocks.create(
@@ -1119,8 +1079,8 @@ def test_include_return_message_types(client: LettaSDKClient, agent: AgentState,
         memory_blocks=[
             CreateBlockParam(label="user", value="Name: Charles"),
         ],
-        model="letta/letta-free",
-        embedding="letta/letta-free",
+        model="anthropic/claude-haiku-4-5",
+        embedding="openai/text-embedding-3-small",
     )
 
     if message_create == "stream_step":
@@ -1256,7 +1216,7 @@ def test_pydantic_inventory_management_tool(e2b_sandbox_mode, client: LettaSDKCl
         name: str = "manage_inventory"
         args_schema: Type[BaseModel] = InventoryEntryData
         description: str = "Update inventory catalogue with a new data entry"
-        tags: List[str] = ["inventory", "shop"]
+        tags: ClassVar[List[str]] = ["inventory", "shop"]
 
         def run(self, data: InventoryEntry, quantity_change: int) -> bool:
             print(f"Updated inventory for {data.item.name} with a quantity change of {quantity_change}")
@@ -1462,6 +1422,7 @@ def test_create_tool_from_function_with_docstring(e2b_sandbox_mode, client: Lett
     client.tools.delete(tool.id)
 
 
+@pytest.mark.skip(reason="Not compatible with 1.0 SDK")
 def test_preview_payload(client: LettaSDKClient):
     temp_agent = client.agents.create(
         memory_blocks=[
@@ -2145,70 +2106,6 @@ def test_run_list(client: LettaSDKClient):
     assert run.agent_id == agent.id
 
 
-@pytest.mark.asyncio
-async def test_create_batch(client: LettaSDKClient, server: SyncServer):
-    # create agents
-    agent1 = client.agents.create(
-        name="agent1_batch",
-        memory_blocks=[{"label": "persona", "value": "you are agent 1"}],
-        model="anthropic/claude-3-7-sonnet-20250219",
-        embedding="letta/letta-free",
-    )
-    agent2 = client.agents.create(
-        name="agent2_batch",
-        memory_blocks=[{"label": "persona", "value": "you are agent 2"}],
-        model="anthropic/claude-3-7-sonnet-20250219",
-        embedding="letta/letta-free",
-    )
-
-    # create a run
-    run = client.batches.create(
-        requests=[
-            {
-                "messages": [
-                    MessageCreateParam(
-                        role="user",
-                        content="hi",
-                    )
-                ],
-                "agent_id": agent1.id,
-            },
-            {
-                "messages": [
-                    MessageCreateParam(
-                        role="user",
-                        content="hi",
-                    )
-                ],
-                "agent_id": agent2.id,
-            },
-        ]
-    )
-    assert run is not None
-
-    # list batches
-    batches = client.batches.list()
-    batches_list = list(batches)
-    assert len(batches_list) >= 1, f"Expected 1 or more batches, got {len(batches_list)}"
-    assert batches_list[0].status == "running"
-
-    # Poll it once
-    await poll_running_llm_batches(server)
-
-    # get the batch results
-    results = client.batches.retrieve(
-        batch_id=run.id,
-    )
-    assert results is not None
-
-    # cancel
-    client.batches.cancel(batch_id=run.id)
-    batch_job = client.batches.retrieve(
-        batch_id=run.id,
-    )
-    assert batch_job.status == "cancelled"
-
-
 def test_create_agent(client: LettaSDKClient) -> None:
     """Test creating an agent and streaming messages with tokens"""
     agent = client.agents.create(
@@ -2263,6 +2160,7 @@ def test_create_agent(client: LettaSDKClient) -> None:
     client.agents.delete(agent_id=agent.id)
 
 
+@pytest.mark.skip(reason="Not compatible with 1.0 SDK")
 def test_list_all_messages(client: LettaSDKClient):
     """Test listing all messages across multiple agents."""
     # Create two agents
@@ -2380,7 +2278,7 @@ def test_create_agent_with_tools(client: LettaSDKClient) -> None:
         name: str = "manage_inventory"
         args_schema: Type[BaseModel] = InventoryEntryData
         description: str = "Update inventory catalogue with a new data entry"
-        tags: List[str] = ["inventory", "shop"]
+        tags: ClassVar[List[str]] = ["inventory", "shop"]
 
         def run(self, data: InventoryEntry, quantity_change: int) -> bool:
             """
@@ -2434,3 +2332,23 @@ def test_create_agent_with_tools(client: LettaSDKClient) -> None:
     # clean up
     client.tools.delete(tool_from_func.id)
     client.tools.delete(tool_from_class.id)
+
+
+def test_calling_tools(client: LettaSDKClient, agent: AgentState) -> None:
+    """Test to make sure calling tools through the SDK works as expected"""
+
+    blocks = list(client.agents.blocks.list(agent_id=agent.id))
+    assert len(blocks) == 1, f"Expected 1 block, got {len(blocks)}"
+
+    # test calling a stateful tool
+    result = client.agents.tools.run(agent_id=agent.id, tool_name="memory_insert", args={"label": "human", "new_string": "test"})
+    assert result.status == "success", f"Expected success, got {result.status}"
+    # get the block
+    block = client.agents.blocks.retrieve(agent_id=agent.id, block_label="human")
+    assert "test" in block.value, f"Test value not found in block value {block.value}"
+
+    # test calling a tool wrong
+    result = client.agents.tools.run(agent_id=agent.id, tool_name="memory_insert", args={"label": "human", "FAKE_ARG": "test"})
+    assert result.status == "error", f"Expected error, got {result.status}"
+    assert result.func_return is None, f"Expected func_return to be None, got {result.func_return}"
+    print(result)

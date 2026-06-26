@@ -120,6 +120,7 @@ class LettaAgentBatch(BaseAgent):
         self.job_manager = job_manager
         self.actor = actor
         self.max_steps = max_steps
+        self.client_skills: list = []
 
     @trace_method
     async def step_until_request(
@@ -217,7 +218,7 @@ class LettaAgentBatch(BaseAgent):
 
         if batch_items:
             log_event(name="bulk_create_batch_items")
-            batch_items_persisted = await self.batch_manager.create_llm_batch_items_bulk_async(batch_items, actor=self.actor)
+            await self.batch_manager.create_llm_batch_items_bulk_async(batch_items, actor=self.actor)
 
         log_event(name="return_batch_response")
         return LettaBatchResponse(
@@ -309,7 +310,7 @@ class LettaAgentBatch(BaseAgent):
         agent_state_map = {agent.id: agent for agent in agent_states}
 
         # Process each agent's results
-        tool_call_results = self._process_agent_results(
+        tool_call_results = await self._process_agent_results(
             agent_ids=agent_ids, batch_item_map=batch_item_map, provider_results=provider_results, llm_batch_id=llm_batch_id
         )
 
@@ -324,7 +325,7 @@ class LettaAgentBatch(BaseAgent):
             request_status_updates=tool_call_results.status_updates,
         )
 
-    def _process_agent_results(self, agent_ids, batch_item_map, provider_results, llm_batch_id):
+    async def _process_agent_results(self, agent_ids, batch_item_map, provider_results, llm_batch_id):
         """
         Process the results for each agent, extracting tool calls and determining continuation status.
 
@@ -347,7 +348,7 @@ class LettaAgentBatch(BaseAgent):
             request_status_updates.append(RequestStatusUpdateInfo(llm_batch_id=llm_batch_id, agent_id=aid, request_status=status))
 
             # Process tool calls
-            name, args, cont = self._extract_tool_call_from_result(item, result)
+            name, args, cont = await self._extract_tool_call_from_result(item, result)
             name_map[aid], args_map[aid], cont_map[aid] = name, args, cont
 
         return ToolCallResults(name_map, args_map, cont_map, request_status_updates)
@@ -363,7 +364,7 @@ class LettaAgentBatch(BaseAgent):
         else:
             return JobStatus.expired
 
-    def _extract_tool_call_from_result(self, item, result):
+    async def _extract_tool_call_from_result(self, item, result):
         """Extract tool call information from a result"""
         llm_client = LLMClient.create(
             provider_type=item.llm_config.model_endpoint_type,
@@ -375,13 +376,10 @@ class LettaAgentBatch(BaseAgent):
         if not isinstance(result, BetaMessageBatchSucceededResult):
             return None, None, False
 
-        tool_call = (
-            llm_client.convert_response_to_chat_completion(
-                response_data=result.message.model_dump(), input_messages=[], llm_config=item.llm_config
-            )
-            .choices[0]
-            .message.tool_calls[0]
+        response = await llm_client.convert_response_to_chat_completion(
+            response_data=result.message.model_dump(), input_messages=[], llm_config=item.llm_config
         )
+        tool_call = response.choices[0].message.tool_calls[0]
 
         return self._extract_tool_call_and_decide_continue(tool_call, item.step_state)
 
@@ -607,7 +605,7 @@ class LettaAgentBatch(BaseAgent):
     def _prepare_tools_per_agent(agent_state: AgentState, tool_rules_solver: ToolRulesSolver) -> List[dict]:
         tools = [t for t in agent_state.tools if t.tool_type in {ToolType.CUSTOM, ToolType.LETTA_CORE, ToolType.LETTA_MEMORY_CORE}]
         valid_tool_names = tool_rules_solver.get_allowed_tool_names(available_tools=set([t.name for t in tools]))
-        return [enable_strict_mode(t.json_schema) for t in tools if t.name in set(valid_tool_names)]
+        return [enable_strict_mode(t.json_schema, strict=agent_state.llm_config.strict) for t in tools if t.name in set(valid_tool_names)]
 
     async def _prepare_in_context_messages_per_agent_async(
         self, agent_state: AgentState, input_messages: List[MessageCreate]
@@ -616,6 +614,7 @@ class LettaAgentBatch(BaseAgent):
             input_messages, agent_state, self.message_manager, self.actor, run_id=None
         )
 
+        self.conversation_id = None
         in_context_messages = await self._rebuild_memory_async(current_in_context_messages + new_in_context_messages, agent_state)
         return in_context_messages
 

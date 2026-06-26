@@ -1,10 +1,10 @@
 from typing import TYPE_CHECKING, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
-from letta.schemas.enums import ProviderType
-from letta.schemas.providers import Provider, ProviderBase, ProviderCheck, ProviderCreate, ProviderUpdate
+from letta.schemas.enums import ProviderCategory, ProviderType
+from letta.schemas.providers import Provider, ProviderCheck, ProviderCreate, ProviderUpdate
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
 from letta.validators import ProviderId
 
@@ -39,7 +39,14 @@ async def list_providers(
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     providers = await server.provider_manager.list_providers_async(
-        before=before, after=after, limit=limit, actor=actor, name=name, provider_type=provider_type, ascending=(order == "asc")
+        before=before,
+        after=after,
+        limit=limit,
+        actor=actor,
+        name=name,
+        provider_type=provider_type,
+        provider_category=[ProviderCategory.byok],
+        ascending=(order == "asc"),
     )
     return providers
 
@@ -122,9 +129,12 @@ async def check_existing_provider(
     provider = await server.provider_manager.get_provider_async(provider_id=provider_id, actor=actor)
 
     # Create a ProviderCheck from the existing provider
+    api_key = await provider.api_key_enc.get_plaintext_async() if provider.api_key_enc else None
+    access_key = await provider.access_key_enc.get_plaintext_async() if provider.access_key_enc else None
     provider_check = ProviderCheck(
         provider_type=provider.provider_type,
-        api_key=provider.api_key,
+        api_key=api_key,
+        access_key=access_key,
         base_url=provider.base_url,
     )
 
@@ -132,6 +142,27 @@ async def check_existing_provider(
     return JSONResponse(
         status_code=status.HTTP_200_OK, content={"message": f"Valid api key for provider_type={provider.provider_type.value}"}
     )
+
+
+@router.patch("/{provider_id}/refresh", response_model=Provider, operation_id="refresh_provider_models")
+async def refresh_provider_models(
+    provider_id: ProviderId,
+    headers: HeaderParams = Depends(get_headers),
+    server: "SyncServer" = Depends(get_letta_server),
+):
+    """
+    Refresh models for a BYOK provider by querying the provider's API.
+    Adds new models and removes ones no longer available.
+    """
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
+    provider = await server.provider_manager.get_provider_async(provider_id=provider_id, actor=actor)
+
+    # Only allow refresh for BYOK providers
+    if provider.provider_category != ProviderCategory.byok:
+        raise HTTPException(status_code=400, detail="Refresh is only supported for BYOK providers")
+
+    await server.provider_manager._sync_default_models_for_provider(provider, actor)
+    return await server.provider_manager.get_provider_async(provider_id=provider_id, actor=actor)
 
 
 @router.delete("/{provider_id}", response_model=None, operation_id="delete_provider")

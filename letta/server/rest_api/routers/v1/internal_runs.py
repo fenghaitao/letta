@@ -8,7 +8,6 @@ from letta.schemas.letta_stop_reason import StopReasonType
 from letta.schemas.run import Run
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server
 from letta.server.server import SyncServer
-from letta.services.run_manager import RunManager
 
 router = APIRouter(prefix="/_internal_runs", tags=["_internal_runs"])
 
@@ -30,6 +29,7 @@ def convert_statuses_to_enum(statuses: Optional[List[str]]) -> Optional[List[Run
 @router.get("/", response_model=List[Run], operation_id="list_internal_runs")
 async def list_runs(
     server: "SyncServer" = Depends(get_letta_server),
+    run_id: Optional[str] = Query(None, description="Filter by a specific run ID."),
     agent_id: Optional[str] = Query(None, description="The unique identifier of the agent associated with the run."),
     agent_ids: Optional[List[str]] = Query(
         None,
@@ -64,6 +64,7 @@ async def list_runs(
         deprecated=True,
     ),
     project_id: Optional[str] = Query(None, description="Filter runs by project ID."),
+    conversation_id: Optional[str] = Query(None, description="Filter runs by conversation ID."),
     duration_percentile: Optional[int] = Query(
         None, description="Filter runs by duration percentile (1-100). Returns runs slower than this percentile."
     ),
@@ -109,6 +110,7 @@ async def list_runs(
 
     runs = await runs_manager.list_runs(
         actor=actor,
+        run_id=run_id,
         agent_ids=agent_ids,
         statuses=parsed_statuses,
         limit=limit,
@@ -122,6 +124,7 @@ async def list_runs(
         step_count_operator=step_count_operator,
         tools_used=tools_used,
         project_id=project_id,
+        conversation_id=conversation_id,
         order_by=order_by,
         duration_percentile=duration_percentile,
         duration_filter=duration_filter,

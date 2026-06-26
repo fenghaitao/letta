@@ -1,16 +1,16 @@
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import AsyncGenerator, List, Optional, Union
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, Request
 from httpx import HTTPStatusError
 from starlette.responses import StreamingResponse
 
+from letta.errors import LettaMCPConnectionError
 from letta.functions.mcp_client.types import SSEServerConfig, StdioServerConfig, StreamableHTTPServerConfig
 from letta.log import get_logger
-from letta.schemas.letta_message import ToolReturnMessage
 from letta.schemas.mcp_server import (
     CreateMCPServerRequest,
     MCPServerUnion,
-    MCPToolExecuteRequest,
+    ToolExecuteRequest,
     UpdateMCPServerRequest,
     convert_generic_to_union,
     convert_update_to_internal,
@@ -27,7 +27,6 @@ from letta.server.server import SyncServer
 from letta.services.mcp.oauth_utils import drill_down_exception, oauth_stream_event
 from letta.services.mcp.stdio_client import AsyncStdioMCPClient
 from letta.services.mcp.types import OauthStreamEvent
-from letta.settings import tool_settings
 
 router = APIRouter(prefix="/mcp-servers", tags=["mcp-servers"])
 
@@ -50,7 +49,7 @@ async def create_mcp_server(
     # TODO: add the tools to the MCP server table we made.
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     new_server = await server.mcp_server_manager.create_mcp_server_from_request(request, actor=actor)
-    return convert_generic_to_union(new_server)
+    return await convert_generic_to_union(new_server)
 
 
 @router.get(
@@ -67,7 +66,10 @@ async def list_mcp_servers(
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     mcp_servers = await server.mcp_server_manager.list_mcp_servers(actor=actor)
-    return [convert_generic_to_union(mcp_server) for mcp_server in mcp_servers]
+    result = []
+    for mcp_server in mcp_servers:
+        result.append(await convert_generic_to_union(mcp_server))
+    return result
 
 
 @router.get(
@@ -85,7 +87,7 @@ async def retrieve_mcp_server(
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     current_server = await server.mcp_server_manager.get_mcp_server_by_id_async(mcp_server_id=mcp_server_id, actor=actor)
-    return convert_generic_to_union(current_server)
+    return await convert_generic_to_union(current_server)
 
 
 @router.delete(
@@ -125,7 +127,7 @@ async def update_mcp_server(
     updated_server = await server.mcp_server_manager.update_mcp_server_by_id(
         mcp_server_id=mcp_server_id, mcp_server_update=internal_update, actor=actor
     )
-    return convert_generic_to_union(updated_server)
+    return await convert_generic_to_union(updated_server)
 
 
 @router.get("/{mcp_server_id}/tools", response_model=List[Tool], operation_id="mcp_list_tools_for_mcp_server")
@@ -164,12 +166,12 @@ async def run_mcp_tool(
     tool_id: str,
     server: SyncServer = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
-    request: MCPToolExecuteRequest = Body(default=MCPToolExecuteRequest()),
+    request: ToolExecuteRequest = Body(default=ToolExecuteRequest()),
 ):
     """
     Execute a specific MCP tool
 
-    The request body should contain the tool arguments in the MCPToolExecuteRequest format.
+    The request body should contain the tool arguments in the ToolExecuteRequest format.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
 
@@ -238,7 +240,7 @@ async def connect_mcp_server(
     mcp_server = await server.mcp_server_manager.get_mcp_server_by_id_async(mcp_server_id=mcp_server_id, actor=actor)
 
     # Convert the MCP server to the appropriate config type
-    config = mcp_server.to_config(resolve_variables=False)
+    config = await mcp_server.to_config_async(resolve_variables=False)
 
     async def oauth_stream_generator(
         mcp_config: Union[StdioServerConfig, SSEServerConfig, StreamableHTTPServerConfig],
@@ -265,8 +267,7 @@ async def connect_mcp_server(
                 tools = await client.list_tools(serialize=True)
                 yield oauth_stream_event(OauthStreamEvent.SUCCESS, tools=tools)
                 return
-            except ConnectionError:
-                # TODO: jnjpng make this connection error check more specific to the 401 unauthorized error
+            except (ConnectionError, LettaMCPConnectionError):
                 if isinstance(client, AsyncStdioMCPClient):
                     logger.warning("OAuth not supported for stdio")
                     yield oauth_stream_event(OauthStreamEvent.ERROR, message="OAuth not supported for stdio")

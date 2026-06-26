@@ -1,8 +1,11 @@
 import json
+import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 from letta.functions.mcp_client.types import (
     MCP_AUTH_HEADER_AUTHORIZATION,
@@ -12,11 +15,11 @@ from letta.functions.mcp_client.types import (
     StdioServerConfig,
     StreamableHTTPServerConfig,
 )
+from letta.helpers.url_validation import validate_mcp_server_url
 from letta.orm.mcp_oauth import OAuthSessionStatus
 from letta.schemas.enums import PrimitiveType
 from letta.schemas.letta_base import LettaBase
 from letta.schemas.secret import Secret
-from letta.settings import settings
 
 
 class BaseMCPServer(LettaBase):
@@ -48,68 +51,118 @@ class MCPServer(BaseMCPServer):
     last_updated_by_id: Optional[str] = Field(None, description="The id of the user that made this Tool.")
     metadata_: Optional[Dict[str, Any]] = Field(default_factory=dict, description="A dictionary of additional metadata for the tool.")
 
-    def get_token_secret(self) -> Secret:
-        """Get the token as a Secret object, preferring encrypted over plaintext."""
-        if self.token_enc is not None:
-            return self.token_enc
-        return Secret.from_db(None, self.token)
+    @field_validator("server_url")
+    @classmethod
+    def validate_server_url(cls, v: Optional[str]) -> Optional[str]:
+        """Validate that server_url is a safe HTTP(S) URL if provided."""
+        if v is None:
+            return v
+        return validate_mcp_server_url(v, resolve_hostname=False)
 
-    def get_custom_headers_secret(self) -> Secret:
-        """Get custom headers as a Secret object (stores JSON string), preferring encrypted over plaintext."""
-        if self.custom_headers_enc is not None:
-            return self.custom_headers_enc
-        # Fallback: convert plaintext dict to JSON string and wrap in Secret
-        if self.custom_headers is not None:
-            json_str = json.dumps(self.custom_headers)
-            return Secret.from_plaintext(json_str)
-        return Secret.from_plaintext(None)
+    def get_token_secret(self) -> Optional[Secret]:
+        """Get the token as a Secret object."""
+        return self.token_enc
+
+    def get_custom_headers_secret(self) -> Optional[Secret]:
+        """Get the custom headers as a Secret object (JSON string)."""
+        return self.custom_headers_enc
 
     def get_custom_headers_dict(self) -> Optional[Dict[str, str]]:
-        """Get custom headers as a plaintext dictionary."""
+        """Get the custom headers as a dictionary."""
+        if self.custom_headers_enc:
+            json_str = self.custom_headers_enc.get_plaintext()
+            if json_str:
+                try:
+                    return json.loads(json_str)
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse custom_headers_enc for MCP server {self.id}: {e}")
+        return None
+
+    async def get_custom_headers_dict_async(self) -> Optional[Dict[str, str]]:
+        """Get custom headers as a plaintext dictionary (async version)."""
         secret = self.get_custom_headers_secret()
-        json_str = secret.get_plaintext()
+        if secret is None:
+            return None
+        json_str = await secret.get_plaintext_async()
         if json_str:
             try:
                 return json.loads(json_str)
-            except (json.JSONDecodeError, TypeError):
-                return None
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"Failed to parse custom_headers_enc for MCP server {self.id}: {e}")
         return None
 
     def set_token_secret(self, secret: Secret) -> None:
-        """Set token from a Secret object, updating both encrypted and plaintext fields."""
+        """Set token from a Secret object."""
         self.token_enc = secret
-        secret_dict = secret.to_dict()
-        # Only set plaintext during migration phase
-        if not secret.was_encrypted:
-            self.token = secret_dict["plaintext"]
-        else:
-            self.token = None
 
     def set_custom_headers_secret(self, secret: Secret) -> None:
-        """Set custom headers from a Secret object (containing JSON string), updating both fields."""
+        """Set custom headers from a Secret object (JSON string)."""
         self.custom_headers_enc = secret
-        secret_dict = secret.to_dict()
-        # Parse JSON string to dict for plaintext field
-        json_str = secret_dict.get("plaintext")
-        if json_str and not secret.was_encrypted:
-            try:
-                self.custom_headers = json.loads(json_str)
-            except (json.JSONDecodeError, TypeError):
-                self.custom_headers = None
-        else:
-            self.custom_headers = None
 
     def to_config(
         self,
         environment_variables: Optional[Dict[str, str]] = None,
         resolve_variables: bool = True,
     ) -> Union[SSEServerConfig, StdioServerConfig, StreamableHTTPServerConfig]:
+        # Get decrypted values directly from encrypted columns
+        token_plaintext = self.token_enc.get_plaintext() if self.token_enc else None
+
+        # Get custom headers as dict from encrypted column
+        headers_plaintext = None
+        if self.custom_headers_enc:
+            json_str = self.custom_headers_enc.get_plaintext()
+            if json_str:
+                try:
+                    headers_plaintext = json.loads(json_str)
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse custom_headers_enc for MCP server {self.id}: {e}")
+
+        if self.server_type == MCPServerType.SSE:
+            config = SSEServerConfig(
+                server_name=self.server_name,
+                server_url=self.server_url,
+                auth_header=MCP_AUTH_HEADER_AUTHORIZATION if token_plaintext and not headers_plaintext else None,
+                auth_token=f"{MCP_AUTH_TOKEN_BEARER_PREFIX} {token_plaintext}" if token_plaintext and not headers_plaintext else None,
+                custom_headers=headers_plaintext,
+            )
+            if resolve_variables:
+                config.resolve_environment_variables(environment_variables)
+            return config
+        elif self.server_type == MCPServerType.STDIO:
+            if self.stdio_config is None:
+                raise ValueError("stdio_config is required for STDIO server type")
+            if resolve_variables:
+                self.stdio_config.resolve_environment_variables(environment_variables)
+            return self.stdio_config
+        elif self.server_type == MCPServerType.STREAMABLE_HTTP:
+            if self.server_url is None:
+                raise ValueError("server_url is required for STREAMABLE_HTTP server type")
+
+            config = StreamableHTTPServerConfig(
+                server_name=self.server_name,
+                server_url=self.server_url,
+                auth_header=MCP_AUTH_HEADER_AUTHORIZATION if token_plaintext and not headers_plaintext else None,
+                auth_token=f"{MCP_AUTH_TOKEN_BEARER_PREFIX} {token_plaintext}" if token_plaintext and not headers_plaintext else None,
+                custom_headers=headers_plaintext,
+            )
+            if resolve_variables:
+                config.resolve_environment_variables(environment_variables)
+            return config
+        else:
+            raise ValueError(f"Unsupported server type: {self.server_type}")
+
+    async def to_config_async(
+        self,
+        environment_variables: Optional[Dict[str, str]] = None,
+        resolve_variables: bool = True,
+    ) -> Union[SSEServerConfig, StdioServerConfig, StreamableHTTPServerConfig]:
+        """Async version of to_config() that uses async decryption."""
         # Get decrypted values for use in config
         token_secret = self.get_token_secret()
-        token_plaintext = token_secret.get_plaintext()
+        token_plaintext = await token_secret.get_plaintext_async() if token_secret else None
 
         # Get custom headers as dict
-        headers_plaintext = self.get_custom_headers_dict()
+        headers_plaintext = await self.get_custom_headers_dict_async()
 
         if self.server_type == MCPServerType.SSE:
             config = SSEServerConfig(
@@ -154,6 +207,14 @@ class UpdateSSEMCPServer(LettaBase):
     token: Optional[str] = Field(None, description="The access token or API key for the MCP server (used for SSE authentication)")
     custom_headers: Optional[Dict[str, str]] = Field(None, description="Custom authentication headers as key-value pairs")
 
+    @field_validator("server_url")
+    @classmethod
+    def validate_server_url(cls, v: Optional[str]) -> Optional[str]:
+        """Validate that server_url is a safe HTTP(S) URL if provided."""
+        if v is None:
+            return v
+        return validate_mcp_server_url(v, resolve_hostname=False)
+
 
 class UpdateStdioMCPServer(LettaBase):
     """Update a Stdio MCP server"""
@@ -172,6 +233,14 @@ class UpdateStreamableHTTPMCPServer(LettaBase):
     auth_header: Optional[str] = Field(None, description="The name of the authentication header (e.g., 'Authorization')")
     auth_token: Optional[str] = Field(None, description="The authentication token or API key value")
     custom_headers: Optional[Dict[str, str]] = Field(None, description="Custom authentication headers as key-value pairs")
+
+    @field_validator("server_url")
+    @classmethod
+    def validate_server_url(cls, v: Optional[str]) -> Optional[str]:
+        """Validate that server_url is a safe HTTP(S) URL if provided."""
+        if v is None:
+            return v
+        return validate_mcp_server_url(v, resolve_hostname=False)
 
 
 UpdateMCPServer = Union[UpdateSSEMCPServer, UpdateStdioMCPServer, UpdateStreamableHTTPMCPServer]
@@ -228,66 +297,6 @@ class MCPOAuthSession(BaseMCPOAuth):
     created_at: datetime = Field(default_factory=datetime.now, description="Session creation time")
     updated_at: datetime = Field(default_factory=datetime.now, description="Last update time")
 
-    def get_access_token_secret(self) -> Secret:
-        """Get the access token as a Secret object, preferring encrypted over plaintext."""
-        if self.access_token_enc is not None:
-            return self.access_token_enc
-        return Secret.from_db(None, self.access_token)
-
-    def get_refresh_token_secret(self) -> Secret:
-        """Get the refresh token as a Secret object, preferring encrypted over plaintext."""
-        if self.refresh_token_enc is not None:
-            return self.refresh_token_enc
-        return Secret.from_db(None, self.refresh_token)
-
-    def get_client_secret_secret(self) -> Secret:
-        """Get the client secret as a Secret object, preferring encrypted over plaintext."""
-        if self.client_secret_enc is not None:
-            return self.client_secret_enc
-        return Secret.from_db(None, self.client_secret)
-
-    def get_authorization_code_secret(self) -> Secret:
-        """Get the authorization code as a Secret object, preferring encrypted over plaintext."""
-        if self.authorization_code_enc is not None:
-            return self.authorization_code_enc
-        return Secret.from_db(None, self.authorization_code)
-
-    def set_access_token_secret(self, secret: Secret) -> None:
-        """Set access token from a Secret object."""
-        self.access_token_enc = secret
-        secret_dict = secret.to_dict()
-        if not secret.was_encrypted:
-            self.access_token = secret_dict["plaintext"]
-        else:
-            self.access_token = None
-
-    def set_refresh_token_secret(self, secret: Secret) -> None:
-        """Set refresh token from a Secret object."""
-        self.refresh_token_enc = secret
-        secret_dict = secret.to_dict()
-        if not secret.was_encrypted:
-            self.refresh_token = secret_dict["plaintext"]
-        else:
-            self.refresh_token = None
-
-    def set_client_secret_secret(self, secret: Secret) -> None:
-        """Set client secret from a Secret object."""
-        self.client_secret_enc = secret
-        secret_dict = secret.to_dict()
-        if not secret.was_encrypted:
-            self.client_secret = secret_dict["plaintext"]
-        else:
-            self.client_secret = None
-
-    def set_authorization_code_secret(self, secret: Secret) -> None:
-        """Set authorization code from a Secret object."""
-        self.authorization_code_enc = secret
-        secret_dict = secret.to_dict()
-        if not secret.was_encrypted:
-            self.authorization_code = secret_dict["plaintext"]
-        else:
-            self.authorization_code = None
-
 
 class MCPOAuthSessionCreate(BaseMCPOAuth):
     """Create a new OAuth session."""
@@ -302,6 +311,7 @@ class MCPOAuthSessionCreate(BaseMCPOAuth):
 class MCPOAuthSessionUpdate(BaseMCPOAuth):
     """Update an existing OAuth session."""
 
+    state: Optional[str] = Field(None, description="OAuth state parameter (for session lookup on callback)")
     authorization_url: Optional[str] = Field(None, description="OAuth authorization URL")
     authorization_code: Optional[str] = Field(None, description="OAuth authorization code")
     access_token: Optional[str] = Field(None, description="OAuth access token")

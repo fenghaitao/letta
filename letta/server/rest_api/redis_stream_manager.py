@@ -4,9 +4,12 @@ import asyncio
 import json
 import time
 from collections import defaultdict
-from typing import AsyncIterator, Dict, List, Optional
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
+from typing import Dict, List, Optional
 
 from letta.data_sources.redis_client import AsyncRedisClient
+from letta.errors import LettaError
 from letta.log import get_logger
 from letta.schemas.enums import RunStatus
 from letta.schemas.letta_message import LettaErrorMessage
@@ -194,12 +197,13 @@ class RedisSSEStreamWriter:
 
 
 async def create_background_stream_processor(
-    stream_generator,
+    stream_generator: AsyncGenerator[str | bytes | tuple[str | bytes, int], None],
     redis_client: AsyncRedisClient,
     run_id: str,
     writer: Optional[RedisSSEStreamWriter] = None,
     run_manager: Optional[RunManager] = None,
     actor: Optional[User] = None,
+    conversation_id: Optional[str] = None,
 ) -> None:
     """
     Process a stream in the background and store chunks to Redis.
@@ -214,10 +218,12 @@ async def create_background_stream_processor(
         writer: Optional pre-configured writer (creates new if not provided)
         run_manager: Optional run manager for updating run status
         actor: Optional actor for run status updates
+        conversation_id: Optional conversation ID for releasing lock on terminal states
     """
     stop_reason = None
     saw_done = False
     saw_error = False
+    error_metadata = None
 
     if writer is None:
         writer = RedisSSEStreamWriter(redis_client)
@@ -227,32 +233,52 @@ async def create_background_stream_processor(
         should_stop_writer = False
 
     try:
-        async for chunk in stream_generator:
-            if isinstance(chunk, tuple):
-                chunk = chunk[0]
+        # Always close the upstream async generator so its `finally` blocks run.
+        # (e.g., stream adapters may persist terminal error metadata on close)
+        async with aclosing(stream_generator):
+            async for chunk in stream_generator:
+                if isinstance(chunk, tuple):
+                    chunk = chunk[0]
 
-            # Track terminal events
-            if isinstance(chunk, str):
-                if "data: [DONE]" in chunk:
-                    saw_done = True
-                if "event: error" in chunk:
-                    saw_error = True
+                # Track terminal events (check at line start to avoid false positives in message content)
+                if isinstance(chunk, str):
+                    if "\ndata: [DONE]" in chunk or chunk.startswith("data: [DONE]"):
+                        saw_done = True
+                    if "\nevent: error" in chunk or chunk.startswith("event: error"):
+                        saw_error = True
 
-            is_done = saw_done or saw_error
+                    # Best-effort extraction of the error payload so we can persist it on the run.
+                    # Chunk format is typically: "event: error\ndata: {json}\n\n"
+                    if saw_error and error_metadata is None:
+                        try:
+                            # Grab the first `data:` line after `event: error`
+                            for line in chunk.splitlines():
+                                if line.startswith("data: "):
+                                    maybe_json = line[len("data: ") :].strip()
+                                    if maybe_json and maybe_json[0] in "[{":
+                                        error_metadata = {"error": json.loads(maybe_json)}
+                                    else:
+                                        error_metadata = {"error": {"message": maybe_json}}
+                                    break
+                        except Exception:
+                            # Don't let parsing failures interfere with streaming
+                            error_metadata = {"error": {"message": "Failed to parse error payload from stream."}}
 
-            await writer.write_chunk(run_id=run_id, data=chunk, is_complete=is_done)
+                is_done = saw_done or saw_error
 
-            if is_done:
-                break
+                await writer.write_chunk(run_id=run_id, data=chunk, is_complete=is_done)
 
-            try:
-                # Extract stop_reason from stop_reason chunks
-                maybe_json_chunk = chunk.split("data: ")[1]
-                maybe_stop_reason = json.loads(maybe_json_chunk) if maybe_json_chunk and maybe_json_chunk[0] == "{" else None
-                if maybe_stop_reason and maybe_stop_reason.get("message_type") == "stop_reason":
-                    stop_reason = maybe_stop_reason.get("stop_reason")
-            except:
-                pass
+                if is_done:
+                    break
+
+                try:
+                    # Extract stop_reason from stop_reason chunks
+                    maybe_json_chunk = chunk.split("data: ")[1]
+                    maybe_stop_reason = json.loads(maybe_json_chunk) if maybe_json_chunk and maybe_json_chunk[0] == "{" else None
+                    if maybe_stop_reason and maybe_stop_reason.get("message_type") == "stop_reason":
+                        stop_reason = maybe_stop_reason.get("stop_reason")
+                except Exception:
+                    pass
 
         # Stream ended naturally - check if we got a proper terminal
         if not saw_done and not saw_error:
@@ -288,13 +314,67 @@ async def create_background_stream_processor(
                 # Set a default stop_reason so run status can be mapped in finally
                 stop_reason = StopReasonType.error.value
 
-    except RunCancelledException as e:
+    except RunCancelledException:
         # Handle cancellation gracefully - don't write error chunk, cancellation event was already sent
         logger.info(f"Stream processing stopped due to cancellation for run {run_id}")
         # The cancellation event was already yielded by cancellation_aware_stream_wrapper
         # Write [DONE] marker to properly close the stream for clients reading from Redis
         await writer.write_chunk(run_id=run_id, data="data: [DONE]\n\n", is_complete=True)
         saw_done = True
+    except asyncio.CancelledError:
+        # Task-level cancellation can happen for different reasons:
+        # - runtime/pod shutdown
+        # - parent task cancellation
+        # - rare cancellation races
+        # Distinguish explicit user run cancellation from infrastructure/task interruption.
+        logger.warning(f"Background stream processor for run {run_id} was cancelled")
+
+        run_was_explicitly_cancelled = False
+        if run_manager and actor:
+            try:
+                run = await run_manager.get_run_by_id(run_id=run_id, actor=actor)
+                run_was_explicitly_cancelled = run.status == RunStatus.cancelled
+            except Exception as lookup_err:
+                logger.warning(f"Failed to inspect run status during cancellation for run {run_id}: {lookup_err}")
+
+        if run_was_explicitly_cancelled:
+            stop_reason = StopReasonType.cancelled.value
+            logger.info(f"Run {run_id} was already cancelled; writing terminal cancelled marker")
+            try:
+                await writer.write_chunk(
+                    run_id=run_id,
+                    data=f"data: {LettaStopReason(stop_reason=StopReasonType.cancelled).model_dump_json()}\n\n",
+                    is_complete=False,
+                )
+                await writer.write_chunk(run_id=run_id, data="data: [DONE]\n\n", is_complete=True)
+            except Exception as write_err:
+                logger.warning(f"Failed to write terminal cancelled marker for run {run_id}: {write_err}")
+            saw_done = True
+        else:
+            stop_reason = StopReasonType.error.value
+            error_message = LettaErrorMessage(
+                run_id=run_id,
+                error_type="stream_task_cancelled",
+                message="Background stream processing was interrupted before completion. Please retry.",
+                detail=None,
+            )
+            error_metadata = {"error": error_message.model_dump()}
+            try:
+                await writer.write_chunk(
+                    run_id=run_id,
+                    data=f"data: {LettaStopReason(stop_reason=StopReasonType.error).model_dump_json()}\n\n",
+                    is_complete=False,
+                )
+                await writer.write_chunk(
+                    run_id=run_id,
+                    data=f"event: error\ndata: {error_message.model_dump_json()}\n\n",
+                    is_complete=False,
+                )
+                await writer.write_chunk(run_id=run_id, data="data: [DONE]\n\n", is_complete=True)
+            except Exception as write_err:
+                logger.warning(f"Failed to write terminal error marker after cancellation for run {run_id}: {write_err}")
+            saw_error = True
+            saw_done = True
     except Exception as e:
         logger.error(f"Error processing stream for run {run_id}: {e}")
         # Write error chunk
@@ -302,7 +382,7 @@ async def create_background_stream_processor(
         error_message = LettaErrorMessage(
             run_id=run_id,
             error_type="internal_error",
-            message="An unknown error occurred with the LLM streaming request.",
+            message=str(e) if isinstance(e, LettaError) else "An unknown error occurred with the LLM streaming request.",
             detail=str(e),
         )
         await writer.write_chunk(
@@ -324,6 +404,18 @@ async def create_background_stream_processor(
         if should_stop_writer:
             await writer.stop()
 
+        # Release the conversation lock BEFORE run status bookkeeping.
+        # The client sees [DONE] and immediately submits the next message
+        # (e.g., tool results). If we hold the lock through the DB commit,
+        # the client hits a 409 race (~1-2s window). The bookkeeping
+        # (run status, metrics, last_stop_reason) is safe to race with
+        # the next request — they touch different rows/fields.
+        if conversation_id:
+            try:
+                await redis_client.release_conversation_lock(conversation_id)
+            except Exception as lock_error:
+                logger.warning(f"Failed to release conversation lock for {conversation_id}: {lock_error}")
+
         # Derive a final stop_reason if one wasn't observed explicitly
         final_stop_reason = stop_reason
         if final_stop_reason is None:
@@ -333,33 +425,22 @@ async def create_background_stream_processor(
                 # Treat DONE without an explicit stop_reason as an error to avoid masking failures
                 final_stop_reason = StopReasonType.error.value
 
-        # Update run status to reflect terminal outcome
+        # Update run status to reflect terminal outcome (lock already released)
         if run_manager and actor and final_stop_reason:
-            # Map stop_reason to run status
-            if final_stop_reason in [
-                StopReasonType.error.value,
-                StopReasonType.llm_api_error.value,
-                StopReasonType.invalid_tool_call.value,
-                StopReasonType.invalid_llm_response.value,
-                StopReasonType.no_tool_call.value,
-            ]:
-                run_status = RunStatus.failed
-            elif final_stop_reason == StopReasonType.cancelled.value:
-                run_status = RunStatus.cancelled
-            elif final_stop_reason in [
-                StopReasonType.end_turn.value,
-                StopReasonType.max_steps.value,
-                StopReasonType.tool_rule.value,
-                StopReasonType.requires_approval.value,
-            ]:
-                run_status = RunStatus.completed
-            else:
+            # Resolve stop_reason using canonical enum mapping to avoid drift.
+            try:
+                run_status = StopReasonType(final_stop_reason).run_status
+            except ValueError:
                 logger.warning(f"Unknown stop_reason '{final_stop_reason}' for run {run_id}, defaulting to completed")
                 run_status = RunStatus.completed
 
+            update_kwargs = {"status": run_status, "stop_reason": final_stop_reason}
+            if run_status == RunStatus.failed and error_metadata is not None:
+                update_kwargs["metadata"] = error_metadata
+
             await run_manager.update_run_by_id_async(
                 run_id=run_id,
-                update=RunUpdate(status=run_status, stop_reason=final_stop_reason),
+                update=RunUpdate(**update_kwargs),
                 actor=actor,
             )
 

@@ -45,7 +45,8 @@ class LLMBatchManager:
             )
             await batch.create_async(session, actor=actor, no_commit=True, no_refresh=True)
             pydantic_batch = batch.to_pydantic()
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
             return pydantic_batch
 
     @enforce_types
@@ -62,7 +63,7 @@ class LLMBatchManager:
         self,
         llm_batch_id: str,
         status: JobStatus,
-        actor: Optional[PydanticUser] = None,
+        actor: PydanticUser,
         latest_polling_response: Optional[BetaMessageBatch] = None,
     ) -> PydanticLLMBatchJob:
         """Update a batch job’s status and optionally its polling response."""
@@ -98,15 +99,16 @@ class LLMBatchManager:
                 )
 
             await session.run_sync(lambda ses: ses.bulk_update_mappings(LLMBatchJob, mappings))
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
 
     @enforce_types
     @trace_method
     async def list_llm_batch_jobs_async(
         self,
         letta_batch_id: str,
+        actor: PydanticUser,
         limit: Optional[int] = None,
-        actor: Optional[PydanticUser] = None,
         after: Optional[str] = None,
     ) -> List[PydanticLLMBatchJob]:
         """
@@ -151,8 +153,8 @@ class LLMBatchManager:
     async def get_messages_for_letta_batch_async(
         self,
         letta_batch_job_id: str,
+        actor: PydanticUser,
         limit: int = 100,
-        actor: Optional[PydanticUser] = None,
         agent_id: Optional[str] = None,
         sort_descending: bool = True,
         cursor: Optional[str] = None,  # Message ID as cursor
@@ -178,6 +180,7 @@ class LLMBatchManager:
                 .join(LLMBatchItem, MessageModel.batch_item_id == LLMBatchItem.id)
                 .join(LLMBatchJob, LLMBatchItem.llm_batch_id == LLMBatchJob.id)
                 .where(LLMBatchJob.letta_batch_job_id == letta_batch_job_id)
+                .where(MessageModel.is_deleted == False)
             )
 
             if actor is not None:
@@ -285,7 +288,8 @@ class LLMBatchManager:
             created_items = await LLMBatchItem.batch_create_async(orm_items, session, actor=actor, no_commit=True, no_refresh=True)
 
             pydantic_items = [item.to_pydantic() for item in created_items]
-            await session.commit()
+            # context manager now handles commits
+            # await session.commit()
             return pydantic_items
 
     @enforce_types
@@ -421,7 +425,8 @@ class LLMBatchManager:
 
             if mappings:
                 await session.run_sync(lambda ses: ses.bulk_update_mappings(LLMBatchItem, mappings))
-                await session.commit()
+                # context manager now handles commits
+                # await session.commit()
 
     @enforce_types
     @trace_method

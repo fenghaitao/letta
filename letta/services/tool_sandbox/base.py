@@ -1,12 +1,16 @@
+import importlib
+import inspect
 import os
 import pickle
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
+from letta.constants import LETTA_MULTI_AGENT_TOOL_MODULE_NAME
 from letta.functions.helpers import generate_model_from_args_json_schema
 from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState
+from letta.schemas.enums import ToolSourceType, ToolType
 from letta.schemas.sandbox_config import SandboxConfig
 from letta.schemas.tool import Tool
 from letta.schemas.tool_execution_result import ToolExecutionResult
@@ -27,6 +31,9 @@ class AsyncToolSandboxBase(ABC):
         tool_name: str,
         args: JsonDict,
         user,
+        tool_id: str,
+        agent_id: Optional[str] = None,
+        project_id: Optional[str] = None,
         tool_object: Optional[Tool] = None,
         sandbox_config: Optional[SandboxConfig] = None,
         sandbox_env_vars: Optional[Dict[str, Any]] = None,
@@ -34,6 +41,9 @@ class AsyncToolSandboxBase(ABC):
         self.tool_name = tool_name
         self.args = args
         self.user = user
+        self.agent_id = agent_id
+        self.project_id = project_id
+        self.tool_id = tool_id
         self.tool = tool_object
 
         # Store provided values or create manager to fetch them later
@@ -57,18 +67,32 @@ class AsyncToolSandboxBase(ABC):
                     f"Agent attempted to invoke tool {self.tool_name} that does not exist for organization {self.user.organization_id}"
                 )
 
-            # Check for reserved keyword arguments
-            tool_arguments = parse_function_arguments(self.tool.source_code, self.tool.name)
+            if not self.tool.source_code and self.tool.tool_type == ToolType.LETTA_MULTI_AGENT_CORE:
+                module = importlib.import_module(LETTA_MULTI_AGENT_TOOL_MODULE_NAME)
+                self.tool.source_code = inspect.getsource(module)
 
-            # TODO: deprecate this
-            if "agent_state" in tool_arguments:
-                self.inject_agent_state = True
-            else:
+            # TypeScript tools do not support agent_state or agent_id injection as function params
+            # (these are Python-only features). Instead, agent_id is exposed via LETTA_AGENT_ID env var.
+            if self.is_typescript_tool():
                 self.inject_agent_state = False
+                self.inject_agent_id = False
+            else:
+                # Check for reserved keyword arguments (Python tools only)
+                tool_arguments = parse_function_arguments(self.tool.source_code, self.tool.name)
 
-            # Check for Letta client and agent_id injection
-            self.inject_letta_client = "letta_client" in tool_arguments or "client" in tool_arguments
-            self.inject_agent_id = "agent_id" in tool_arguments
+                # TODO: deprecate this
+                # Note: AgentState injection is a legacy feature for Python tools only.
+                if "agent_state" in tool_arguments:
+                    self.inject_agent_state = True
+                else:
+                    self.inject_agent_state = False
+
+                self.inject_agent_id = "agent_id" in tool_arguments
+
+            # Always inject Letta client (available as `client` variable in sandbox)
+            # For Python: letta_client package
+            # For TypeScript: @letta-ai/letta-client package
+            self.inject_letta_client = True
 
             self.is_async_function = self._detect_async_function()
         self._initialized = True
@@ -92,13 +116,23 @@ class AsyncToolSandboxBase(ABC):
         """
         raise NotImplementedError
 
+    def is_typescript_tool(self) -> bool:
+        """Check if the tool is a TypeScript tool based on source_type."""
+        if self.tool and self.tool.source_type:
+            return self.tool.source_type == ToolSourceType.typescript or self.tool.source_type == "typescript"
+        return False
+
     @trace_method
     async def generate_execution_script(self, agent_state: Optional[AgentState], wrap_print_with_markers: bool = False) -> str:
         """
         Generate code to run inside of execution sandbox. Serialize the agent state and arguments, call the tool,
-        then base64-encode/pickle the result. Constructs the python file.
+        then base64-encode/pickle the result. Constructs the python file (or TypeScript for TS tools).
         """
         await self._init_async()
+
+        # Route to TypeScript generator for TypeScript tools
+        if self.is_typescript_tool():
+            return await self._generate_typescript_execution_script(agent_state)
         future_import = False
         schema_code = None
 
@@ -165,6 +199,7 @@ class AsyncToolSandboxBase(ABC):
             [
                 "from typing import *",
                 "import pickle",
+                "import json as _letta_json",
                 "import sys",
                 "import base64",
                 "import struct",
@@ -175,11 +210,18 @@ class AsyncToolSandboxBase(ABC):
             lines.append("import asyncio")
 
         if inject_agent_state:
-            lines.extend(["import letta", "from letta import *"])  # noqa: F401
+            lines.extend(["import letta", "from letta import *"])
 
-        # Import Letta client if needed
+        # Import Letta client if available (wrapped in try/except for sandboxes without letta_client installed)
         if inject_letta_client:
-            lines.append("from letta_client import Letta")
+            lines.extend(
+                [
+                    "try:",
+                    "    from letta_client import Letta",
+                    "except ImportError:",
+                    "    Letta = None",
+                ]
+            )
 
         if schema_imports:
             lines.append(schema_imports.rstrip())
@@ -189,24 +231,26 @@ class AsyncToolSandboxBase(ABC):
         else:
             lines.append("agent_state = None")
 
-        # Initialize Letta client if needed
+        # Initialize Letta client if needed (client is always available as a variable, may be None)
         if inject_letta_client:
-            from letta.settings import settings
-
             lines.extend(
                 [
                     "# Initialize Letta client for tool execution",
-                    "letta_client = Letta(",
-                    f"    base_url={repr(settings.default_base_url)},",
-                    f"    token={repr(settings.default_token)}",
-                    ")",
-                    "# Compatibility shim for client.agents.get",
-                    "try:",
-                    "    _agents = letta_client.agents",
-                    "    if not hasattr(_agents, 'get') and hasattr(_agents, 'retrieve'):",
-                    "        setattr(_agents, 'get', _agents.retrieve)",
-                    "except Exception:",
-                    "    pass",
+                    "import os",
+                    "client = None",
+                    "if Letta is not None and os.getenv('LETTA_API_KEY'):",
+                    "    # Check letta_client version to use correct parameter name",
+                    "    from packaging import version as pkg_version",
+                    "    import letta_client as lc_module",
+                    "    lc_version = pkg_version.parse(lc_module.__version__)",
+                    "    if lc_version < pkg_version.parse('1.0.0'):",
+                    "        client = Letta(",
+                    "            token=os.getenv('LETTA_API_KEY')",
+                    "        )",
+                    "    else:",
+                    "        client = Letta(",
+                    "            api_key=os.getenv('LETTA_API_KEY')",
+                    "        )",
                 ]
             )
 
@@ -222,6 +266,27 @@ class AsyncToolSandboxBase(ABC):
 
         if tool_source_code:
             lines.append(tool_source_code.rstrip())
+
+        if self.args:
+            raw_args = ", ".join([f"{name!r}: {name}" for name in self.args])
+            lines.extend(
+                [
+                    f"__letta_raw_args = {{{raw_args}}}",
+                    "try:",
+                    "    from letta.functions.ast_parsers import coerce_dict_args_by_annotations",
+                    f"    __letta_func = {self.tool.name}",
+                    "    __letta_annotations = getattr(__letta_func, '__annotations__', {})",
+                    "    __letta_coerced_args = coerce_dict_args_by_annotations(",
+                    "        __letta_raw_args,",
+                    "        __letta_annotations,",
+                    "        allow_unsafe_eval=True,",
+                    "        extra_globals=__letta_func.__globals__,",
+                    "    )",
+                ]
+            )
+            for name in self.args:
+                lines.append(f"    {name} = __letta_coerced_args.get({name!r}, {name})")
+            lines.extend(["except Exception:", "    pass"])
 
         if not self.is_async_function:
             # sync variant
@@ -245,11 +310,18 @@ class AsyncToolSandboxBase(ABC):
                     '    print(f"Failed to serialize result with Pydantic wrapper: {e}")',
                     "    _serialized_result = str(_function_result)",
                     "",
+                    "if agent_state is not None:",
+                    "    try:",
+                    "        _letta_agent_state_payload = agent_state.model_dump(mode='json')",
+                    "    except Exception:",
+                    "        _letta_agent_state_payload = None",
+                    "else:",
+                    "    _letta_agent_state_payload = None",
                     f"{local_sandbox_result_var_name} = {{",
                     '    "results": _serialized_result,',
-                    '    "agent_state": agent_state',
+                    '    "agent_state": _letta_agent_state_payload',
                     "}",
-                    f"{local_sandbox_result_var_name}_pkl = pickle.dumps({local_sandbox_result_var_name})",
+                    f"{local_sandbox_result_var_name}_pkl = _letta_json.dumps({local_sandbox_result_var_name}, default=str).encode('utf-8')",
                 ]
             )
         else:
@@ -275,9 +347,16 @@ class AsyncToolSandboxBase(ABC):
                     '        print(f"Failed to serialize result with Pydantic wrapper: {e}")',
                     "        _serialized_result = str(_function_result)",
                     "",
+                    "    if agent_state is not None:",
+                    "        try:",
+                    "            _letta_agent_state_payload = agent_state.model_dump(mode='json')",
+                    "        except Exception:",
+                    "            _letta_agent_state_payload = None",
+                    "    else:",
+                    "        _letta_agent_state_payload = None",
                     "    return {",
                     '        "results": _serialized_result,',
-                    '        "agent_state": agent_state',
+                    '        "agent_state": _letta_agent_state_payload',
                     "    }",
                 ]
             )
@@ -285,7 +364,9 @@ class AsyncToolSandboxBase(ABC):
                 lines.append(f"{local_sandbox_result_var_name} = await _async_wrapper()")
             else:
                 lines.append(f"{local_sandbox_result_var_name} = asyncio.run(_async_wrapper())")
-            lines.append(f"{local_sandbox_result_var_name}_pkl = pickle.dumps({local_sandbox_result_var_name})")
+            lines.append(
+                f"{local_sandbox_result_var_name}_pkl = _letta_json.dumps({local_sandbox_result_var_name}, default=str).encode('utf-8')"
+            )
 
         if wrap_print_with_markers:
             lines.extend(
@@ -305,6 +386,25 @@ class AsyncToolSandboxBase(ABC):
             lines.append(f"base64.b64encode({local_sandbox_result_var_name}_pkl).decode('utf-8')")
 
         return "\n".join(lines) + "\n"
+
+    async def _generate_typescript_execution_script(self, agent_state: Optional[AgentState]) -> str:
+        """
+        Generate TypeScript code to run inside of execution sandbox.
+
+        TypeScript tools:
+        - Do NOT support agent_state injection (stateless)
+        - agent_id is available via process.env.LETTA_AGENT_ID
+        - Return JSON-serialized results instead of pickle
+        - Require explicit json_schema (no docstring parsing)
+        """
+        from letta.services.tool_sandbox.typescript_generator import generate_typescript_execution_script
+
+        return generate_typescript_execution_script(
+            tool_name=self.tool.name,
+            tool_source_code=self.tool.source_code,
+            args=self.args,
+            json_schema=self.tool.json_schema,
+        )
 
     def initialize_param(self, name: str, raw_value: JsonValue) -> str:
         """
@@ -338,13 +438,8 @@ class AsyncToolSandboxBase(ABC):
         if self.inject_agent_state:
             param_list.append("agent_state=agent_state")
 
-        if self.inject_letta_client:
-            # Check if the function expects 'client' or 'letta_client'
-            tool_arguments = parse_function_arguments(self.tool.source_code, self.tool.name)
-            if "client" in tool_arguments:
-                param_list.append("client=letta_client")
-            elif "letta_client" in tool_arguments:
-                param_list.append("letta_client=letta_client")
+        # Note: client is always available as a variable in the sandbox scope
+        # Tools should access it directly rather than receiving it as a parameter
 
         if self.inject_agent_id:
             param_list.append("agent_id=agent_id")
@@ -367,7 +462,7 @@ class AsyncToolSandboxBase(ABC):
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == self.tool.name:
                     return True
             return False
-        except:
+        except Exception:
             return False
 
     def use_top_level_await(self) -> bool:
@@ -378,20 +473,46 @@ class AsyncToolSandboxBase(ABC):
         """
         return False  # Default to False for local execution
 
-    async def _gather_env_vars(self, agent_state: AgentState | None, additional_env_vars: dict[str, str], sbx_id: str, is_local: bool):
+    async def _gather_env_vars(
+        self, agent_state: AgentState | None, additional_env_vars: dict[str, str] | None, sbx_id: str, is_local: bool
+    ):
+        """
+        Gather environment variables with proper layering:
+        1. OS environment (for local sandboxes only)
+        2. Global sandbox env vars from DB (always included)
+        3. Provided sandbox env vars (agent-scoped, override global on key collision)
+        4. Agent state env vars
+        5. Additional runtime env vars (highest priority)
+        """
         env = os.environ.copy() if is_local else {}
+
+        # Always fetch and include global sandbox env vars from DB
+        global_env_vars = await self.sandbox_config_manager.get_sandbox_env_vars_as_dict_async(
+            sandbox_config_id=sbx_id, actor=self.user, limit=None
+        )
+        env.update(global_env_vars)
+
+        # Override with provided sandbox env vars
         if self.provided_sandbox_env_vars:
             env.update(self.provided_sandbox_env_vars)
-        else:
-            env_vars = await self.sandbox_config_manager.get_sandbox_env_vars_as_dict_async(
-                sandbox_config_id=sbx_id, actor=self.user, limit=None
-            )
-            env.update(env_vars)
 
+        # TOOD: may be duplicative with provided sandbox env vars above
+        # Override with agent state env vars
         if agent_state:
             env.update(agent_state.get_agent_env_vars_as_dict())
 
+        # Override with additional runtime env vars (highest priority)
         if additional_env_vars:
             env.update(additional_env_vars)
+
+        # Inject agent, project, and tool IDs as environment variables
+        if self.agent_id:
+            env["LETTA_AGENT_ID"] = self.agent_id
+        if self.project_id:
+            env["LETTA_PROJECT_ID"] = self.project_id
+        env["LETTA_TOOL_ID"] = self.tool_id
+
+        # Filter out None values to prevent subprocess errors
+        env = {k: v for k, v in env.items() if v is not None}
 
         return env

@@ -25,15 +25,15 @@ def post_json_auth_request(uri, json_payload, auth_type, auth_key):
 
     # Used by OpenAI, together.ai, Mistral AI
     elif auth_type == "bearer_token":
-        if auth_key is None:
-            raise ValueError(f"auth_type is {auth_type}, but auth_key is null")
+        if not auth_key:
+            raise ValueError(f"auth_type is {auth_type}, but auth_key is null or empty")
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {auth_key}"}
         response = requests.post(uri, json=json_payload, headers=headers)
 
     # Used by OpenAI Azure
     elif auth_type == "api_key":
-        if auth_key is None:
-            raise ValueError(f"auth_type is {auth_type}, but auth_key is null")
+        if not auth_key:
+            raise ValueError(f"auth_type is {auth_type}, but auth_key is null or empty")
         headers = {"Content-Type": "application/json", "api-key": f"{auth_key}"}
         response = requests.post(uri, json=json_payload, headers=headers)
 
@@ -58,11 +58,11 @@ def load_grammar_file(grammar):
     return grammar_str
 
 
-# TODO: support tokenizers/tokenizer apis available in local models
-def count_tokens(s: str, model: str = "gpt-4") -> int:
-    from letta.utils import count_tokens
-
-    return count_tokens(s, model)
+## TODO: support tokenizers/tokenizer apis available in local models
+# def count_tokens(s: str, model: str = "gpt-4") -> int:
+#    from letta.utils import count_tokens
+#
+#    return count_tokens(s, model)
 
 
 def num_tokens_from_functions(functions: List[dict], model: str = "gpt-4"):

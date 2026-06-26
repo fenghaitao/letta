@@ -37,12 +37,25 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
         tool_name: str,
         args: JsonDict,
         user,
+        tool_id: str,
+        agent_id: Optional[str] = None,
+        project_id: Optional[str] = None,
         force_recreate_venv=False,
         tool_object: Optional[Tool] = None,
         sandbox_config: Optional[SandboxConfig] = None,
         sandbox_env_vars: Optional[Dict[str, Any]] = None,
     ):
-        super().__init__(tool_name, args, user, tool_object, sandbox_config=sandbox_config, sandbox_env_vars=sandbox_env_vars)
+        super().__init__(
+            tool_name,
+            args,
+            user,
+            tool_id=tool_id,
+            agent_id=agent_id,
+            project_id=project_id,
+            tool_object=tool_object,
+            sandbox_config=sandbox_config,
+            sandbox_env_vars=sandbox_env_vars,
+        )
         self.force_recreate_venv = force_recreate_venv
 
     @trace_method
@@ -64,21 +77,8 @@ class AsyncToolSandboxLocal(AsyncToolSandboxBase):
         local_configs = sbx_config.get_local_config()
         use_venv = local_configs.use_venv
 
-        # Prepare environment variables
-        env = os.environ.copy()
-        if self.provided_sandbox_env_vars:
-            env.update(self.provided_sandbox_env_vars)
-        else:
-            env_vars = await self.sandbox_config_manager.get_sandbox_env_vars_as_dict_async(
-                sandbox_config_id=sbx_config.id, actor=self.user, limit=100
-            )
-            env.update(env_vars)
-
-        if agent_state:
-            env.update(agent_state.get_agent_env_vars_as_dict())
-
-        if additional_env_vars:
-            env.update(additional_env_vars)
+        # Prepare environment variables using standardized gathering logic
+        env = await self._gather_env_vars(agent_state, additional_env_vars, sbx_config.id, is_local=True)
 
         # Make sure sandbox directory exists
         sandbox_dir = os.path.expanduser(local_configs.sandbox_dir)

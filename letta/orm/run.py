@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, ForeignKey, Index, String
+from sqlalchemy import JSON, BigInteger, Boolean, ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from letta.orm.mixins import OrganizationMixin, ProjectMixin, TemplateMixin
@@ -30,6 +30,7 @@ class Run(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateMixin):
         Index("ix_runs_created_at", "created_at", "id"),
         Index("ix_runs_agent_id", "agent_id"),
         Index("ix_runs_organization_id", "organization_id"),
+        Index("ix_runs_conversation_id", "conversation_id"),
     )
 
     # Generate run ID with run- prefix
@@ -49,6 +50,11 @@ class Run(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateMixin):
 
     # Agent relationship - A run belongs to one agent
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.id"), nullable=False, doc="The agent that owns this run.")
+
+    # Conversation relationship - Optional, a run may be associated with a conversation
+    conversation_id: Mapped[Optional[str]] = mapped_column(
+        String, ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True, doc="The conversation this run belongs to."
+    )
 
     # Callback related columns
     callback_url: Mapped[Optional[str]] = mapped_column(String, nullable=True, doc="When set, POST to this URL after run completion.")

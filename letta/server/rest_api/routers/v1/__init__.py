@@ -3,14 +3,17 @@ from letta.server.rest_api.routers.v1.anthropic import router as anthropic_route
 from letta.server.rest_api.routers.v1.archives import router as archives_router
 from letta.server.rest_api.routers.v1.blocks import router as blocks_router
 from letta.server.rest_api.routers.v1.chat_completions import router as chat_completions_router, router as openai_chat_completions_router
+from letta.server.rest_api.routers.v1.conversations import router as conversations_router
 from letta.server.rest_api.routers.v1.embeddings import router as embeddings_router
 from letta.server.rest_api.routers.v1.folders import router as folders_router
+from letta.server.rest_api.routers.v1.git_http import router as git_http_router
 from letta.server.rest_api.routers.v1.groups import router as groups_router
 from letta.server.rest_api.routers.v1.health import router as health_router
 from letta.server.rest_api.routers.v1.identities import router as identities_router
 from letta.server.rest_api.routers.v1.internal_agents import router as internal_agents_router
 from letta.server.rest_api.routers.v1.internal_blocks import router as internal_blocks_router
 from letta.server.rest_api.routers.v1.internal_runs import router as internal_runs_router
+from letta.server.rest_api.routers.v1.internal_search import router as internal_search_router
 from letta.server.rest_api.routers.v1.internal_templates import router as internal_templates_router
 from letta.server.rest_api.routers.v1.jobs import router as jobs_router
 from letta.server.rest_api.routers.v1.llms import router as llm_router
@@ -26,19 +29,24 @@ from letta.server.rest_api.routers.v1.tags import router as tags_router
 from letta.server.rest_api.routers.v1.telemetry import router as telemetry_router
 from letta.server.rest_api.routers.v1.tools import router as tools_router
 from letta.server.rest_api.routers.v1.voice import router as voice_router
+from letta.server.rest_api.routers.v1.zai import router as zai_router
 
 ROUTERS = [
     anthropic_router,
+    zai_router,
     archives_router,
     tools_router,
     sources_router,
     folders_router,
     agents_router,
+    conversations_router,
     chat_completions_router,
+    git_http_router,
     groups_router,
     identities_router,
     internal_agents_router,
     internal_blocks_router,
+    internal_search_router,
     internal_runs_router,
     internal_templates_router,
     llm_router,

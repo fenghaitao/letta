@@ -1,32 +1,8 @@
-import json
-import logging
-import os
-import random
-import re
-import string
-import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import List
-from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from _pytest.python_api import approx
-from anthropic.types.beta import BetaMessage
-from anthropic.types.beta.messages import BetaMessageBatchIndividualResponse, BetaMessageBatchSucceededResult
 
 # Import shared fixtures and constants from conftest
-from conftest import (
-    CREATE_DELAY_SQLITE,
-    DEFAULT_EMBEDDING_CONFIG,
-    USING_SQLITE,
-)
-from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall, Function as OpenAIFunction
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError, InvalidRequestError
-from sqlalchemy.orm.exc import StaleDataError
-
-from letta.config import LettaConfig
 from letta.constants import (
     BASE_MEMORY_TOOLS,
     BASE_SLEEPTIME_TOOLS,
@@ -34,73 +10,27 @@ from letta.constants import (
     BASE_VOICE_SLEEPTIME_CHAT_TOOLS,
     BASE_VOICE_SLEEPTIME_TOOLS,
     BUILTIN_TOOLS,
-    DEFAULT_ORG_ID,
-    DEFAULT_ORG_NAME,
     FILES_TOOLS,
-    LETTA_TOOL_EXECUTION_DIR,
     LETTA_TOOL_SET,
     LOCAL_ONLY_MULTI_AGENT_TOOLS,
     MCP_TOOL_TAG_NAME_PREFIX,
     MULTI_AGENT_TOOLS,
 )
-from letta.data_sources.redis_client import NoopAsyncRedisClient, get_redis_client
 from letta.errors import LettaAgentNotFoundError
-from letta.functions.functions import derive_openai_json_schema, parse_source_code
-from letta.functions.mcp_client.types import MCPTool
-from letta.helpers import ToolRulesSolver
-from letta.helpers.datetime_helpers import AsyncTimer
-from letta.jobs.types import ItemUpdateInfo, RequestStatusUpdateInfo, StepStatusUpdateInfo
-from letta.orm import Base, Block
-from letta.orm.block_history import BlockHistory
+from letta.functions.functions import parse_source_code
 from letta.orm.errors import NoResultFound, UniqueConstraintViolationError
-from letta.orm.file import FileContent as FileContentModel, FileMetadata as FileMetadataModel
-from letta.schemas.agent import CreateAgent, UpdateAgent
-from letta.schemas.block import Block as PydanticBlock, BlockUpdate, CreateBlock
+from letta.schemas.agent import CreateAgent
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import (
-    ActorType,
-    AgentStepStatus,
-    FileProcessingStatus,
-    JobStatus,
-    JobType,
-    MessageRole,
-    ProviderType,
-    SandboxType,
-    StepStatus,
-    TagMatchMode,
     ToolType,
-    VectorDBProvider,
 )
-from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate, SandboxEnvironmentVariableUpdate
-from letta.schemas.file import FileMetadata, FileMetadata as PydanticFileMetadata
-from letta.schemas.identity import IdentityCreate, IdentityProperty, IdentityPropertyType, IdentityType, IdentityUpdate, IdentityUpsert
-from letta.schemas.job import BatchJob, Job, Job as PydanticJob, JobUpdate, LettaRequestConfig
-from letta.schemas.letta_message import UpdateAssistantMessage, UpdateReasoningMessage, UpdateSystemMessage, UpdateUserMessage
-from letta.schemas.letta_message_content import TextContent
-from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
-from letta.schemas.llm_batch_job import AgentStepState, LLMBatchItem
 from letta.schemas.llm_config import LLMConfig
-from letta.schemas.message import Message as PydanticMessage, MessageCreate, MessageUpdate
-from letta.schemas.openai.chat_completion_response import UsageStatistics
-from letta.schemas.organization import Organization, Organization as PydanticOrganization, OrganizationUpdate
-from letta.schemas.passage import Passage as PydanticPassage
 from letta.schemas.pip_requirement import PipRequirement
-from letta.schemas.run import Run as PydanticRun
-from letta.schemas.sandbox_config import E2BSandboxConfig, LocalSandboxConfig, SandboxConfigCreate, SandboxConfigUpdate
-from letta.schemas.source import Source as PydanticSource, SourceUpdate
-from letta.schemas.tool import Tool as PydanticTool, ToolCreate, ToolUpdate
-from letta.schemas.tool_rule import InitToolRule
-from letta.schemas.user import User as PydanticUser, UserUpdate
+from letta.schemas.tool import Tool as PydanticTool, ToolUpdate
 from letta.server.db import db_registry
 from letta.server.server import SyncServer
-from letta.services.block_manager import BlockManager
-from letta.services.helpers.agent_manager_helper import calculate_base_tools, calculate_multi_agent_tools, validate_agent_exists_async
-from letta.services.step_manager import FeedbackType
 from letta.services.tool_schema_generator import generate_schema_for_tool_creation
-from letta.settings import settings, tool_settings
-from letta.utils import calculate_file_defaults_based_on_context_window
-from tests.helpers.utils import comprehensive_agent_checks, validate_context_window_overview
-from tests.utils import random_string
+from letta.settings import settings
 
 # ======================================================================================================================
 # AgentManager Tests - Tools Relationship
@@ -1278,7 +1208,7 @@ async def test_upsert_base_tools(server: SyncServer, default_user):
     tools = await server.tool_manager.upsert_base_tools_async(actor=default_user)
 
     # Calculate expected tools accounting for production filtering
-    if settings.environment == "PRODUCTION":
+    if settings.environment == "prod":
         expected_tool_names = sorted(LETTA_TOOL_SET - set(LOCAL_ONLY_MULTI_AGENT_TOOLS))
     else:
         expected_tool_names = sorted(LETTA_TOOL_SET)
@@ -1330,7 +1260,7 @@ async def test_upsert_filtered_base_tools(server: SyncServer, default_user, tool
     tool_names = sorted([t.name for t in tools])
 
     # Adjust expected names for multi-agent tools in production
-    if tool_type == ToolType.LETTA_MULTI_AGENT_CORE and settings.environment == "PRODUCTION":
+    if tool_type == ToolType.LETTA_MULTI_AGENT_CORE and settings.environment == "prod":
         expected_sorted = sorted(set(expected_names) - set(LOCAL_ONLY_MULTI_AGENT_TOOLS))
     else:
         expected_sorted = sorted(expected_names)
@@ -2015,8 +1945,8 @@ def test_function():
         source_code=source_code,
     )
 
-    with pytest.raises(ValueError) as exc_info:
-        created_tool = await tool_manager.create_or_update_tool_async(tool, default_user)
+    with pytest.raises(ValueError):
+        await tool_manager.create_or_update_tool_async(tool, default_user)
 
 
 async def test_error_on_create_tool_with_name_conflict(server: SyncServer, default_user, default_organization):
@@ -2175,6 +2105,225 @@ async def test_update_tool_name(server: SyncServer, default_user, default_organi
 
 
 @pytest.mark.asyncio
+async def test_list_tools_with_project_id_filtering(server: SyncServer, default_user):
+    """Test listing tools with project_id filtering - global vs project-scoped tools."""
+
+    # Create separate functions for each tool (name must match function name)
+    def global_tool_func() -> str:
+        """A global tool with no project_id.
+
+        Returns:
+            str: Test result
+        """
+        return "global_result"
+
+    def project_a_tool_func() -> str:
+        """A tool scoped to project A.
+
+        Returns:
+            str: Test result
+        """
+        return "project_a_result"
+
+    def project_b_tool_func() -> str:
+        """A tool scoped to project B.
+
+        Returns:
+            str: Test result
+        """
+        return "project_b_result"
+
+    # Create a global tool (project_id = None)
+    global_tool = PydanticTool(
+        name="global_tool_func",
+        description="A global tool with no project_id",
+        source_code=parse_source_code(global_tool_func),
+        source_type="python",
+        tool_type=ToolType.CUSTOM,
+        project_id=None,  # Global tool
+    )
+    global_tool.json_schema = generate_schema_for_tool_creation(global_tool)
+    global_tool = await server.tool_manager.create_or_update_tool_async(global_tool, actor=default_user)
+
+    # Create a tool scoped to project_a
+    project_a_id = f"project-{uuid.uuid4()}"
+    project_a_tool = PydanticTool(
+        name="project_a_tool_func",
+        description="A tool scoped to project A",
+        source_code=parse_source_code(project_a_tool_func),
+        source_type="python",
+        tool_type=ToolType.CUSTOM,
+        project_id=project_a_id,
+    )
+    project_a_tool.json_schema = generate_schema_for_tool_creation(project_a_tool)
+    project_a_tool = await server.tool_manager.create_or_update_tool_async(project_a_tool, actor=default_user)
+
+    # Create a tool scoped to project_b
+    project_b_id = f"project-{uuid.uuid4()}"
+    project_b_tool = PydanticTool(
+        name="project_b_tool_func",
+        description="A tool scoped to project B",
+        source_code=parse_source_code(project_b_tool_func),
+        source_type="python",
+        tool_type=ToolType.CUSTOM,
+        project_id=project_b_id,
+    )
+    project_b_tool.json_schema = generate_schema_for_tool_creation(project_b_tool)
+    project_b_tool = await server.tool_manager.create_or_update_tool_async(project_b_tool, actor=default_user)
+
+    # Test 1: When no project_id is provided, list ALL tools
+    all_tools = await server.tool_manager.list_tools_async(actor=default_user, upsert_base_tools=False, project_id=None)
+    all_tool_names = {t.name for t in all_tools}
+    assert "global_tool_func" in all_tool_names
+    assert "project_a_tool_func" in all_tool_names
+    assert "project_b_tool_func" in all_tool_names
+
+    # Test 2: When project_a_id is provided, list only global + project_a tools
+    project_a_tools = await server.tool_manager.list_tools_async(actor=default_user, upsert_base_tools=False, project_id=project_a_id)
+    project_a_tool_names = {t.name for t in project_a_tools}
+    assert "global_tool_func" in project_a_tool_names  # Global tools should be included
+    assert "project_a_tool_func" in project_a_tool_names  # Project A tool should be included
+    assert "project_b_tool_func" not in project_a_tool_names  # Project B tool should NOT be included
+
+    # Test 3: When project_b_id is provided, list only global + project_b tools
+    project_b_tools = await server.tool_manager.list_tools_async(actor=default_user, upsert_base_tools=False, project_id=project_b_id)
+    project_b_tool_names = {t.name for t in project_b_tools}
+    assert "global_tool_func" in project_b_tool_names  # Global tools should be included
+    assert "project_b_tool_func" in project_b_tool_names  # Project B tool should be included
+    assert "project_a_tool_func" not in project_b_tool_names  # Project A tool should NOT be included
+
+    # Test 4: When a non-existent project_id is provided, list only global tools
+    non_existent_project_id = f"project-{uuid.uuid4()}"
+    non_existent_project_tools = await server.tool_manager.list_tools_async(
+        actor=default_user, upsert_base_tools=False, project_id=non_existent_project_id
+    )
+    non_existent_tool_names = {t.name for t in non_existent_project_tools}
+    assert "global_tool_func" in non_existent_tool_names  # Global tools should be included
+    assert "project_a_tool_func" not in non_existent_tool_names
+    assert "project_b_tool_func" not in non_existent_tool_names
+
+
+@pytest.mark.asyncio
+async def test_count_tools_with_project_id_filtering(server: SyncServer, default_user):
+    """Test counting tools with project_id filtering - global vs project-scoped tools."""
+
+    # Create separate functions for each tool
+    def count_global_tool_0() -> str:
+        """Global tool 0 for counting.
+
+        Returns:
+            str: Test result
+        """
+        return "count_result"
+
+    def count_global_tool_1() -> str:
+        """Global tool 1 for counting.
+
+        Returns:
+            str: Test result
+        """
+        return "count_result"
+
+    def count_project_a_tool_0() -> str:
+        """Project A tool 0 for counting.
+
+        Returns:
+            str: Test result
+        """
+        return "count_result"
+
+    def count_project_a_tool_1() -> str:
+        """Project A tool 1 for counting.
+
+        Returns:
+            str: Test result
+        """
+        return "count_result"
+
+    def count_project_a_tool_2() -> str:
+        """Project A tool 2 for counting.
+
+        Returns:
+            str: Test result
+        """
+        return "count_result"
+
+    def count_project_b_tool() -> str:
+        """Project B tool for counting.
+
+        Returns:
+            str: Test result
+        """
+        return "count_result"
+
+    global_funcs = [count_global_tool_0, count_global_tool_1]
+    project_a_funcs = [count_project_a_tool_0, count_project_a_tool_1, count_project_a_tool_2]
+
+    # Create 2 global tools
+    for tool_func in global_funcs:
+        global_tool = PydanticTool(
+            name=tool_func.__name__,
+            description="Global tool for counting",
+            source_code=parse_source_code(tool_func),
+            source_type="python",
+            tool_type=ToolType.CUSTOM,
+            project_id=None,
+        )
+        global_tool.json_schema = generate_schema_for_tool_creation(global_tool)
+        await server.tool_manager.create_or_update_tool_async(global_tool, actor=default_user)
+
+    # Create 3 tools scoped to project_a
+    project_a_id = f"project-{uuid.uuid4()}"
+    for tool_func in project_a_funcs:
+        project_a_tool = PydanticTool(
+            name=tool_func.__name__,
+            description="Project A tool for counting",
+            source_code=parse_source_code(tool_func),
+            source_type="python",
+            tool_type=ToolType.CUSTOM,
+            project_id=project_a_id,
+        )
+        project_a_tool.json_schema = generate_schema_for_tool_creation(project_a_tool)
+        await server.tool_manager.create_or_update_tool_async(project_a_tool, actor=default_user)
+
+    # Create 1 tool scoped to project_b
+    project_b_id = f"project-{uuid.uuid4()}"
+    project_b_tool_pydantic = PydanticTool(
+        name="count_project_b_tool",
+        description="Project B tool for counting",
+        source_code=parse_source_code(count_project_b_tool),
+        source_type="python",
+        tool_type=ToolType.CUSTOM,
+        project_id=project_b_id,
+    )
+    project_b_tool_pydantic.json_schema = generate_schema_for_tool_creation(project_b_tool_pydantic)
+    await server.tool_manager.create_or_update_tool_async(project_b_tool_pydantic, actor=default_user)
+
+    # Test 1: Count without project_id filter should count all custom tools we created (2 + 3 + 1 = 6)
+    all_count = await server.tool_manager.count_tools_async(actor=default_user, tool_types=[ToolType.CUSTOM.value], search="count_")
+    assert all_count == 6
+
+    # Test 2: Count with project_a_id should count global + project_a tools (2 + 3 = 5)
+    project_a_count = await server.tool_manager.count_tools_async(
+        actor=default_user, tool_types=[ToolType.CUSTOM.value], search="count_", project_id=project_a_id
+    )
+    assert project_a_count == 5
+
+    # Test 3: Count with project_b_id should count global + project_b tools (2 + 1 = 3)
+    project_b_count = await server.tool_manager.count_tools_async(
+        actor=default_user, tool_types=[ToolType.CUSTOM.value], search="count_", project_id=project_b_id
+    )
+    assert project_b_count == 3
+
+    # Test 4: Count with non-existent project_id should only count global tools (2)
+    non_existent_project_id = f"project-{uuid.uuid4()}"
+    global_only_count = await server.tool_manager.count_tools_async(
+        actor=default_user, tool_types=[ToolType.CUSTOM.value], search="count_", project_id=non_existent_project_id
+    )
+    assert global_only_count == 2
+
+
+@pytest.mark.asyncio
 async def test_list_tools_with_corrupted_tool(server: SyncServer, default_user, print_tool):
     """Test that list_tools still works even if there's a corrupted tool (missing json_schema) in the database."""
 
@@ -2204,7 +2353,8 @@ async def test_list_tools_with_corrupted_tool(server: SyncServer, default_user, 
         )
 
         session.add(corrupted_tool)
-        await session.commit()
+        # context manager now handles commits
+        # await session.commit()
         corrupted_tool_id = corrupted_tool.id
 
     # Now try to list tools - it should still work and not include the corrupted tool

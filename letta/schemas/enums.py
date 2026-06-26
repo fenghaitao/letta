@@ -26,6 +26,7 @@ class PrimitiveType(str, Enum):
     SANDBOX_CONFIG = "sandbox"  # Note: sandbox_config IDs use "sandbox" prefix
     STEP = "step"
     IDENTITY = "identity"
+    CONVERSATION = "conv"
 
     # Infrastructure types
     MCP_SERVER = "mcp_server"
@@ -52,21 +53,29 @@ class PrimitiveType(str, Enum):
 class ProviderType(str, Enum):
     anthropic = "anthropic"
     azure = "azure"
+    baseten = "baseten"
     bedrock = "bedrock"
     cerebras = "cerebras"
+    chatgpt_oauth = "chatgpt_oauth"
     deepseek = "deepseek"
+    fireworks = "fireworks"
     google_ai = "google_ai"
     google_vertex = "google_vertex"
     groq = "groq"
     hugging_face = "hugging-face"
     letta = "letta"
     lmstudio_openai = "lmstudio_openai"
+    minimax = "minimax"
     mistral = "mistral"
     ollama = "ollama"
     openai = "openai"
     together = "together"
     vllm = "vllm"
+    sglang = "sglang"
+    openrouter = "openrouter"
     xai = "xai"
+    zai = "zai"
+    zai_coding = "zai_coding"
 
 
 class AgentType(str, Enum):
@@ -90,6 +99,14 @@ class ProviderCategory(str, Enum):
     byok = "byok"
 
 
+class LLMCallType(str, Enum):
+    """Type of LLM call for telemetry tracking."""
+
+    agent_step = "agent_step"
+    summarization = "summarization"
+    tool_generation = "tool_generation"
+
+
 class MessageRole(str, Enum):
     assistant = "assistant"
     user = "user"
@@ -97,6 +114,7 @@ class MessageRole(str, Enum):
     function = "function"
     system = "system"
     approval = "approval"
+    summary = "summary"
 
 
 class MessageSourceType(str, Enum):

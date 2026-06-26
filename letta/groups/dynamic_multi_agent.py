@@ -1,6 +1,10 @@
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:
+    from letta.agents.letta_agent import LettaAgent as Agent
 
 from letta.agents.base_agent import BaseAgent
+from letta.agents.letta_agent import LettaAgent
 from letta.interface import AgentInterface
 from letta.orm import User
 from letta.schemas.agent import AgentState
@@ -91,7 +95,7 @@ class DynamicMultiAgent(BaseAgent):
 
                 # Parse manager response
                 responses = Message.to_letta_messages_from_list(manager_agent.last_response_messages)
-                assistant_message = [response for response in responses if response.message_type == "assistant_message"][0]
+                assistant_message = next(response for response in responses if response.message_type == "assistant_message")
                 for name, agent_id in [(agents[agent_id].agent_state.name, agent_id) for agent_id in agent_id_options]:
                     if name.lower() in assistant_message.content.lower():
                         speaker_id = agent_id
@@ -204,14 +208,14 @@ class DynamicMultiAgent(BaseAgent):
             "holds info about them, and you should use this context to inform your decision."
         )
         self.agent_state.memory.update_block_value(label="persona", value=persona_block.value + group_chat_manager_persona)
-        return Agent(
+        return LettaAgent(
             agent_state=self.agent_state,
             interface=self.interface,
             user=self.user,
             save_last_response=True,
         )
 
-    def load_participant_agent(self, agent_id: str) -> Agent:
+    def load_participant_agent(self, agent_id: str) -> LettaAgent:
         agent_state = self.agent_manager.get_agent_by_id(agent_id=agent_id, actor=self.user)
         persona_block = agent_state.memory.get_block(label="persona")
         group_chat_participant_persona = (
@@ -220,7 +224,7 @@ class DynamicMultiAgent(BaseAgent):
             f"Description of the group: {self.description}. About you: "
         )
         agent_state.memory.update_block_value(label="persona", value=group_chat_participant_persona + persona_block.value)
-        return Agent(
+        return LettaAgent(
             agent_state=agent_state,
             interface=self.interface,
             user=self.user,

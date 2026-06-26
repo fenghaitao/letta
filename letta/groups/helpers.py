@@ -1,6 +1,7 @@
 import json
 from typing import Dict, Optional, Union
 
+from letta.agents.letta_agent import LettaAgent
 from letta.interface import AgentInterface
 from letta.orm.group import Group
 from letta.orm.user import User
@@ -17,7 +18,7 @@ def load_multi_agent(
     actor: User,
     interface: Union[AgentInterface, None] = None,
     mcp_clients: Optional[Dict[str, AsyncBaseMCPClient]] = None,
-) -> "Agent":
+) -> LettaAgent:
     if len(group.agent_ids) == 0:
         raise ValueError("Empty group: group must have at least one agent")
 
@@ -63,7 +64,7 @@ def load_multi_agent(
             )
         case ManagerType.sleeptime:
             if not agent_state.enable_sleeptime:
-                return Agent(
+                return LettaAgent(
                     agent_state=agent_state,
                     interface=interface,
                     user=actor,
@@ -97,7 +98,7 @@ def stringify_message(message: Message, use_assistant_name: bool = False) -> str
                 elif isinstance(content, ImageContent):
                     messages.append(f"{message.name or 'user'}: [Image Here]")
             return "\n".join(messages)
-        except:
+        except Exception:
             if message.content and len(message.content) > 0:
                 return f"{message.name or 'user'}: {message.content[0].text}"
             return None

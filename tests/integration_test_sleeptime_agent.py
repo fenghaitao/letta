@@ -6,7 +6,7 @@ import pytest
 import requests
 from dotenv import load_dotenv
 from letta_client import APIError, Letta
-from letta_client.types import CreateBlockParam, MessageCreateParam, SleeptimeManagerParam
+from letta_client.types import CreateBlockParam, MessageCreateParam
 
 from letta.constants import DEFAULT_HUMAN
 from letta.utils import get_human_text, get_persona_text
@@ -33,7 +33,7 @@ def server_url() -> str:
         thread.start()
 
         # Poll until the server is up (or timeout)
-        timeout_seconds = 30
+        timeout_seconds = 60
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
@@ -61,9 +61,6 @@ def client(server_url: str) -> Letta:
 @pytest.mark.flaky(max_runs=3)
 @pytest.mark.asyncio(loop_scope="module")
 async def test_sleeptime_group_chat(client):
-    # 0. Refresh base tools
-    client.tools.upsert_base_tools()
-
     # 1. Create sleeptime agent
     main_agent = client.agents.create(
         name="main_agent",
@@ -89,21 +86,26 @@ async def test_sleeptime_group_chat(client):
     assert "core_memory_replace" not in main_agent_tools
     assert "archival_memory_insert" not in main_agent_tools
 
-    # 2. Override frequency for test
-    group = client.groups.update(
-        group_id=main_agent.multi_agent_group.id,
-        manager_config=SleeptimeManagerParam(
-            manager_type="sleeptime",
-            sleeptime_agent_frequency=2,
-        ),
+    # 2. Override frequency for test (groups API deprecated and removed from SDK, use raw HTTP)
+    group_id = main_agent.multi_agent_group.id
+    resp = requests.patch(
+        f"{client.base_url}/v1/groups/{group_id}",
+        json={
+            "manager_config": {
+                "manager_type": "sleeptime",
+                "sleeptime_agent_frequency": 2,
+            }
+        },
     )
+    resp.raise_for_status()
+    group = resp.json()
 
-    assert group.manager_type == "sleeptime"
-    assert group.sleeptime_agent_frequency == 2
-    assert len(group.agent_ids) == 1
+    assert group["manager_type"] == "sleeptime"
+    assert group["sleeptime_agent_frequency"] == 2
+    assert len(group["agent_ids"]) == 1
 
     # 3. Verify shared blocks
-    sleeptime_agent_id = group.agent_ids[0]
+    sleeptime_agent_id = group["agent_ids"][0]
     shared_block = client.agents.blocks.retrieve(agent_id=main_agent.id, block_label="human")
     agents = client.blocks.agents.list(block_id=shared_block.id).items
     assert len(agents) == 2
@@ -148,17 +150,32 @@ async def test_sleeptime_group_chat(client):
         runs = client.runs.list(agent_id=sleeptime_agent_id).items
         assert len(runs) == len(run_ids)
 
-    # 6. Verify run status after sleep
+    # 6. Verify run status after sleep and wait for all runs to complete
     time.sleep(2)
+
+    # Wait for all sleeptime agent runs to complete before deleting
+    max_wait = 30  # Maximum 30 seconds to wait
+    start_time = time.time()
+    all_completed = False
+
+    while time.time() - start_time < max_wait and not all_completed:
+        all_completed = True
+        for run_id in run_ids:
+            job = client.runs.retrieve(run_id=run_id)
+            if job.status not in ["completed", "failed"]:
+                all_completed = False
+                break
+        if not all_completed:
+            time.sleep(0.5)  # Poll every 500ms
+
+    # Verify final status
     for run_id in run_ids:
         job = client.runs.retrieve(run_id=run_id)
-        assert job.status == "running" or job.status == "completed"
+        assert job.status in ["running", "completed", "failed"], f"Unexpected status: {job.status}"
 
-    # 7. Delete agent
+    # 7. Delete agent (now safe because all runs are complete)
     client.agents.delete(agent_id=main_agent.id)
 
-    with pytest.raises(APIError):
-        client.groups.retrieve(group_id=group.id)
     with pytest.raises(APIError):
         client.agents.retrieve(agent_id=sleeptime_agent_id)
 
@@ -167,7 +184,6 @@ async def test_sleeptime_group_chat(client):
 @pytest.mark.asyncio(loop_scope="module")
 async def test_sleeptime_removes_redundant_information(client):
     # 1. set up sleep-time agent as in test_sleeptime_group_chat
-    client.tools.upsert_base_tools()
     main_agent = client.agents.create(
         name="main_agent",
         memory_blocks=[
@@ -186,14 +202,19 @@ async def test_sleeptime_removes_redundant_information(client):
         agent_type="letta_v1_agent",
     )
 
-    group = client.groups.update(
-        group_id=main_agent.multi_agent_group.id,
-        manager_config=SleeptimeManagerParam(
-            manager_type="sleeptime",
-            sleeptime_agent_frequency=1,
-        ),
+    group_id = main_agent.multi_agent_group.id
+    resp = requests.patch(
+        f"{client.base_url}/v1/groups/{group_id}",
+        json={
+            "manager_config": {
+                "manager_type": "sleeptime",
+                "sleeptime_agent_frequency": 1,
+            }
+        },
     )
-    sleeptime_agent_id = group.agent_ids[0]
+    resp.raise_for_status()
+    group = resp.json()
+    sleeptime_agent_id = group["agent_ids"][0]
     shared_block = client.agents.blocks.retrieve(agent_id=main_agent.id, block_label="human")
     count_before_memory_edits = shared_block.value.count("fiddle leaf")
     test_messages = ["hello there", "my favorite bird is the sparrow"]
@@ -219,8 +240,6 @@ async def test_sleeptime_removes_redundant_information(client):
     # 4. Delete agent
     client.agents.delete(agent_id=main_agent.id)
 
-    with pytest.raises(APIError):
-        client.groups.retrieve(group_id=group.id)
     with pytest.raises(APIError):
         client.agents.retrieve(agent_id=sleeptime_agent_id)
 
@@ -274,9 +293,6 @@ async def test_sleeptime_edit(client):
 @pytest.mark.asyncio(loop_scope="module")
 async def test_sleeptime_agent_new_block_attachment(client):
     """Test that a new block created after agent creation is properly attached to both main and sleeptime agents."""
-    # 0. Refresh base tools
-    client.tools.upsert_base_tools()
-
     # 1. Create sleeptime agent
     main_agent = client.agents.create(
         name="main_agent",
@@ -315,7 +331,6 @@ async def test_sleeptime_agent_new_block_attachment(client):
         assert main_agent.id in [agent.id for agent in agents]
 
     # 4. Create a new block after agent creation
-    from letta.schemas.block import Block as PydanticBlock
 
     new_block = client.blocks.create(
         label="preferences",

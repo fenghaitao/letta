@@ -1,15 +1,18 @@
 """Tests for provider initialization via ProviderManager.sync_base_providers and provider model persistence."""
 
+import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from letta.orm.errors import UniqueConstraintViolationError
+from letta.schemas.agent import CreateAgent
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import ProviderCategory, ProviderType
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.providers import LettaProvider, OpenAIProvider, ProviderCreate
+from letta.server.server import SyncServer
 from letta.services.organization_manager import OrganizationManager
 from letta.services.provider_manager import ProviderManager
 from letta.services.user_manager import UserManager
@@ -107,7 +110,6 @@ async def test_sync_base_providers_handles_race_condition(default_user, provider
 
     # Mock a race condition: list returns empty, but create fails with UniqueConstraintViolation
     original_list = provider_manager.list_providers_async
-    original_create = provider_manager.create_provider_async
 
     call_count = {"count": 0}
 
@@ -1740,3 +1742,1558 @@ async def test_handle_uniqueness_per_org(default_user, provider_manager):
     assert model is not None
     assert model.provider_id == provider_1.id  # Still original provider
     assert model.max_context_window == 8192  # Still original
+
+
+@pytest.mark.asyncio
+async def test_delete_provider_cascades_to_models(default_user, provider_manager, monkeypatch):
+    """Test that deleting a provider also soft-deletes its associated models."""
+    test_id = generate_test_id()
+
+    # Mock _sync_default_models_for_provider to avoid external API calls
+    async def mock_sync(provider, actor):
+        pass  # Don't actually sync - we'll manually create models below
+
+    monkeypatch.setattr(provider_manager, "_sync_default_models_for_provider", mock_sync)
+
+    # 1. Create a BYOK provider (org-scoped, so the actor can delete it)
+    provider_create = ProviderCreate(
+        name=f"test-cascade-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-test-key",
+    )
+    provider = await provider_manager.create_provider_async(provider_create, actor=default_user, is_byok=True)
+
+    # 2. Manually sync models to the provider
+    llm_models = [
+        LLMConfig(
+            model=f"gpt-4o-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-{test_id}/gpt-4o",
+            provider_name=provider.name,
+            provider_category=ProviderCategory.byok,
+        ),
+        LLMConfig(
+            model=f"gpt-4o-mini-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=16384,
+            handle=f"test-{test_id}/gpt-4o-mini",
+            provider_name=provider.name,
+            provider_category=ProviderCategory.byok,
+        ),
+    ]
+
+    embedding_models = [
+        EmbeddingConfig(
+            embedding_model=f"text-embedding-3-small-{test_id}",
+            embedding_endpoint_type="openai",
+            embedding_endpoint="https://api.openai.com/v1",
+            embedding_dim=1536,
+            embedding_chunk_size=300,
+            handle=f"test-{test_id}/text-embedding-3-small",
+        ),
+    ]
+
+    await provider_manager.sync_provider_models_async(
+        provider=provider,
+        llm_models=llm_models,
+        embedding_models=embedding_models,
+        organization_id=default_user.organization_id,  # Org-scoped for BYOK provider
+    )
+
+    # 3. Verify models exist before deletion
+    llm_models_before = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+        provider_id=provider.id,
+    )
+    embedding_models_before = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="embedding",
+        provider_id=provider.id,
+    )
+
+    llm_handles_before = {m.handle for m in llm_models_before}
+    embedding_handles_before = {m.handle for m in embedding_models_before}
+
+    assert f"test-{test_id}/gpt-4o" in llm_handles_before
+    assert f"test-{test_id}/gpt-4o-mini" in llm_handles_before
+    assert f"test-{test_id}/text-embedding-3-small" in embedding_handles_before
+
+    # 4. Delete the provider
+    await provider_manager.delete_provider_by_id_async(provider.id, actor=default_user)
+
+    # 5. Verify models are soft-deleted (no longer returned in list)
+    all_llm_models_after = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+    )
+    all_embedding_models_after = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="embedding",
+    )
+
+    all_llm_handles_after = {m.handle for m in all_llm_models_after}
+    all_embedding_handles_after = {m.handle for m in all_embedding_models_after}
+
+    # All models from the deleted provider should be gone
+    assert f"test-{test_id}/gpt-4o" not in all_llm_handles_after
+    assert f"test-{test_id}/gpt-4o-mini" not in all_llm_handles_after
+    assert f"test-{test_id}/text-embedding-3-small" not in all_embedding_handles_after
+
+    # 6. Verify provider is also deleted
+    providers_after = await provider_manager.list_providers_async(
+        actor=default_user,
+        name=f"test-cascade-{test_id}",
+    )
+    assert len(providers_after) == 0
+
+
+@pytest.mark.asyncio
+async def test_get_llm_config_from_handle_includes_max_tokens(default_user, provider_manager):
+    """Test that get_llm_config_from_handle includes max_tokens from provider's get_default_max_output_tokens.
+
+    This test verifies that:
+    1. The max_tokens field is populated when retrieving LLMConfig from a handle
+    2. The max_tokens value comes from the provider's get_default_max_output_tokens method
+    3. Different providers return different default max_tokens values (e.g., OpenAI returns 16384)
+    """
+    test_id = generate_test_id()
+
+    # Create an OpenAI provider
+    provider_create = ProviderCreate(
+        name=f"test-openai-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-test-key",
+        base_url="https://api.openai.com/v1",
+    )
+    provider = await provider_manager.create_provider_async(provider_create, actor=default_user, is_byok=False)
+
+    # Sync a model with the provider
+    llm_models = [
+        LLMConfig(
+            model=f"gpt-4o-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-{test_id}/gpt-4o",
+            provider_name=provider.name,
+            provider_category=ProviderCategory.base,
+        ),
+    ]
+
+    await provider_manager.sync_provider_models_async(
+        provider=provider,
+        llm_models=llm_models,
+        embedding_models=[],
+        organization_id=None,  # Global model
+    )
+
+    # Get LLMConfig from handle
+    llm_config = await provider_manager.get_llm_config_from_handle(
+        handle=f"test-{test_id}/gpt-4o",
+        actor=default_user,
+    )
+
+    # Verify max_tokens is set and comes from OpenAI provider's default (16384 for non-o1/o3 models)
+    assert llm_config.max_tokens is not None, "max_tokens should be set"
+    assert llm_config.max_tokens == 16384, f"Expected max_tokens=16384 for OpenAI gpt-4o, got {llm_config.max_tokens}"
+
+    # Test with a gpt-5 model (should have 16384)
+    llm_models_gpt5 = [
+        LLMConfig(
+            model=f"gpt-5-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=200000,
+            handle=f"test-{test_id}/gpt-5",
+            provider_name=provider.name,
+            provider_category=ProviderCategory.base,
+        ),
+    ]
+
+    await provider_manager.sync_provider_models_async(
+        provider=provider,
+        llm_models=llm_models_gpt5,
+        embedding_models=[],
+        organization_id=None,
+    )
+
+    llm_config_gpt5 = await provider_manager.get_llm_config_from_handle(
+        handle=f"test-{test_id}/gpt-5",
+        actor=default_user,
+    )
+
+    # gpt-5 models also have 16384 max_tokens
+    assert llm_config_gpt5.max_tokens == 16384, f"Expected max_tokens=16384 for gpt-5, got {llm_config_gpt5.max_tokens}"
+
+
+@pytest.mark.asyncio
+async def test_server_list_llm_models_async_reads_from_database(default_user, provider_manager):
+    """Test that the server's list_llm_models_async reads models from database, not in-memory.
+
+    This test verifies that:
+    1. Models synced to the database are returned by list_llm_models_async
+    2. The LLMConfig objects are correctly constructed from database-cached models
+    3. Provider filtering works correctly when reading from database
+    """
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create a provider in the database
+    provider_create = ProviderCreate(
+        name=f"test-db-provider-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-test-key",
+        base_url="https://custom.openai.com/v1",
+    )
+    provider = await provider_manager.create_provider_async(provider_create, actor=default_user, is_byok=False)
+
+    # Sync models to database
+    llm_models = [
+        LLMConfig(
+            model=f"custom-model-1-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://custom.openai.com/v1",
+            context_window=32000,
+            handle=f"test-{test_id}/custom-model-1",
+            provider_name=provider.name,
+            provider_category=ProviderCategory.base,
+        ),
+        LLMConfig(
+            model=f"custom-model-2-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://custom.openai.com/v1",
+            context_window=64000,
+            handle=f"test-{test_id}/custom-model-2",
+            provider_name=provider.name,
+            provider_category=ProviderCategory.base,
+        ),
+    ]
+
+    await provider_manager.sync_provider_models_async(
+        provider=provider,
+        llm_models=llm_models,
+        embedding_models=[],
+        organization_id=None,
+    )
+
+    # Create server instance
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+
+    # List LLM models via server
+    models = await server.list_llm_models_async(
+        actor=default_user,
+        provider_name=f"test-db-provider-{test_id}",
+    )
+
+    # Verify models were read from database
+    handles = {m.handle for m in models}
+    assert f"test-{test_id}/custom-model-1" in handles, "custom-model-1 should be in database"
+    assert f"test-{test_id}/custom-model-2" in handles, "custom-model-2 should be in database"
+
+    # Verify LLMConfig properties are correctly populated from database
+    model_1 = next(m for m in models if m.handle == f"test-{test_id}/custom-model-1")
+    assert model_1.model == f"custom-model-1-{test_id}"
+    assert model_1.context_window == 32000
+    assert model_1.model_endpoint == "https://custom.openai.com/v1"
+    assert model_1.provider_name == f"test-db-provider-{test_id}"
+
+    model_2 = next(m for m in models if m.handle == f"test-{test_id}/custom-model-2")
+    assert model_2.model == f"custom-model-2-{test_id}"
+    assert model_2.context_window == 64000
+
+
+@pytest.mark.asyncio
+async def test_get_enabled_providers_async_queries_database(default_user, provider_manager):
+    """Test that get_enabled_providers_async queries providers from database, not in-memory list.
+
+    This test verifies that:
+    1. Providers created in the database are returned by get_enabled_providers_async
+    2. The method queries the database, not an in-memory _enabled_providers list
+    3. Provider filtering by category works correctly from database
+    """
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create providers in the database
+    base_provider_create = ProviderCreate(
+        name=f"test-base-provider-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-test-key",
+        base_url="https://api.openai.com/v1",
+    )
+    await provider_manager.create_provider_async(base_provider_create, actor=default_user, is_byok=False)
+
+    byok_provider_create = ProviderCreate(
+        name=f"test-byok-provider-{test_id}",
+        provider_type=ProviderType.anthropic,
+        api_key="sk-test-byok-key",
+    )
+    await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Create server instance - importantly, don't set _enabled_providers
+    # This ensures we're testing database queries, not in-memory list
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    # Clear in-memory providers to prove we're querying database
+    server._enabled_providers = []
+
+    # Get all providers - should query database
+    all_providers = await server.get_enabled_providers_async(actor=default_user)
+    provider_names = [p.name for p in all_providers]
+
+    assert f"test-base-provider-{test_id}" in provider_names, "Base provider should be in database"
+    assert f"test-byok-provider-{test_id}" in provider_names, "BYOK provider should be in database"
+
+    # Filter by provider category
+    base_only = await server.get_enabled_providers_async(
+        actor=default_user,
+        provider_category=[ProviderCategory.base],
+    )
+    base_only_names = [p.name for p in base_only]
+
+    assert f"test-base-provider-{test_id}" in base_only_names, "Base provider should be in base-only list"
+    assert f"test-byok-provider-{test_id}" not in base_only_names, "BYOK provider should NOT be in base-only list"
+
+    byok_only = await server.get_enabled_providers_async(
+        actor=default_user,
+        provider_category=[ProviderCategory.byok],
+    )
+    byok_only_names = [p.name for p in byok_only]
+
+    assert f"test-byok-provider-{test_id}" in byok_only_names, "BYOK provider should be in byok-only list"
+    assert f"test-base-provider-{test_id}" not in byok_only_names, "Base provider should NOT be in byok-only list"
+
+    # Filter by provider name
+    specific_provider = await server.get_enabled_providers_async(
+        actor=default_user,
+        provider_name=f"test-base-provider-{test_id}",
+    )
+
+    assert len(specific_provider) == 1
+    assert specific_provider[0].name == f"test-base-provider-{test_id}"
+    assert specific_provider[0].provider_type == ProviderType.openai
+
+    # Filter by provider type
+    openai_providers = await server.get_enabled_providers_async(
+        actor=default_user,
+        provider_type=ProviderType.openai,
+    )
+    openai_names = [p.name for p in openai_providers]
+
+    assert f"test-base-provider-{test_id}" in openai_names
+    assert f"test-byok-provider-{test_id}" not in openai_names  # This is anthropic type
+
+
+# =============================================================================
+# BYOK Provider and Model Listing Integration Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_list_providers_filters_by_category(default_user, provider_manager):
+    """Test that list_providers_async correctly filters by provider_category."""
+    test_id = generate_test_id()
+
+    # Create a base provider
+    base_provider_create = ProviderCreate(
+        name=f"test-base-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-base-key",
+    )
+    base_provider = await provider_manager.create_provider_async(base_provider_create, actor=default_user, is_byok=False)
+
+    # Create a BYOK provider
+    byok_provider_create = ProviderCreate(
+        name=f"test-byok-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-byok-key",
+    )
+    byok_provider = await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Verify base provider has correct category
+    assert base_provider.provider_category == ProviderCategory.base
+
+    # Verify BYOK provider has correct category
+    assert byok_provider.provider_category == ProviderCategory.byok
+
+    # List only BYOK providers
+    byok_providers = await provider_manager.list_providers_async(
+        actor=default_user,
+        provider_category=[ProviderCategory.byok],
+    )
+    byok_names = [p.name for p in byok_providers]
+
+    assert f"test-byok-{test_id}" in byok_names
+    assert f"test-base-{test_id}" not in byok_names
+
+    # List only base providers
+    base_providers = await provider_manager.list_providers_async(
+        actor=default_user,
+        provider_category=[ProviderCategory.base],
+    )
+    base_names = [p.name for p in base_providers]
+
+    assert f"test-base-{test_id}" in base_names
+    assert f"test-byok-{test_id}" not in base_names
+
+
+@pytest.mark.asyncio
+async def test_base_provider_api_key_not_stored_in_db(default_user, provider_manager):
+    """Test that sync_base_providers does NOT store API keys for base providers."""
+    # Create base providers with API keys
+    base_providers = [
+        OpenAIProvider(name="test-openai-no-key", api_key="sk-should-not-be-stored"),
+    ]
+
+    # Sync to database
+    await provider_manager.sync_base_providers(base_providers=base_providers, actor=default_user)
+
+    # Retrieve the provider from database
+    providers = await provider_manager.list_providers_async(name="test-openai-no-key", actor=default_user)
+    assert len(providers) == 1
+
+    provider = providers[0]
+    assert provider.provider_category == ProviderCategory.base
+
+    # The API key should be empty (not stored) for base providers
+    if provider.api_key_enc:
+        api_key = await provider.api_key_enc.get_plaintext_async()
+        assert api_key == "" or api_key is None, "Base provider API key should not be stored in database"
+
+
+@pytest.mark.asyncio
+async def test_byok_provider_api_key_stored_in_db(default_user, provider_manager):
+    """Test that BYOK providers DO have their API keys stored in the database."""
+    test_id = generate_test_id()
+
+    # Create a BYOK provider with API key
+    byok_provider_create = ProviderCreate(
+        name=f"test-byok-with-key-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-byok-should-be-stored",
+    )
+    await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Retrieve the provider from database
+    providers = await provider_manager.list_providers_async(name=f"test-byok-with-key-{test_id}", actor=default_user)
+    assert len(providers) == 1
+
+    provider = providers[0]
+    assert provider.provider_category == ProviderCategory.byok
+
+    # The API key SHOULD be stored for BYOK providers
+    assert provider.api_key_enc is not None
+    api_key = await provider.api_key_enc.get_plaintext_async()
+    assert api_key == "sk-byok-should-be-stored", "BYOK provider API key should be stored in database"
+
+
+@pytest.mark.asyncio
+async def test_server_list_llm_models_base_from_db(default_user, provider_manager):
+    """Test that server.list_llm_models_async fetches base models from database."""
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create base provider and models (these ARE stored in DB)
+    base_provider_create = ProviderCreate(
+        name=f"test-base-llm-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-base-key",
+    )
+    base_provider = await provider_manager.create_provider_async(base_provider_create, actor=default_user, is_byok=False)
+
+    base_llm_model = LLMConfig(
+        model=f"base-gpt-4o-{test_id}",
+        model_endpoint_type="openai",
+        model_endpoint="https://api.openai.com/v1",
+        context_window=128000,
+        handle=f"test-base-llm-{test_id}/gpt-4o",
+        provider_name=base_provider.name,
+        provider_category=ProviderCategory.base,
+    )
+
+    await provider_manager.sync_provider_models_async(
+        provider=base_provider,
+        llm_models=[base_llm_model],
+        embedding_models=[],
+        organization_id=None,
+    )
+
+    # Create server and list models
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    server._enabled_providers = []  # Clear to test database-backed listing
+
+    # List all models - base models come from DB
+    all_models = await server.list_llm_models_async(actor=default_user)
+    all_handles = [m.handle for m in all_models]
+
+    assert f"test-base-llm-{test_id}/gpt-4o" in all_handles, "Base model should be in list"
+
+    # List only base models
+    base_models = await server.list_llm_models_async(
+        actor=default_user,
+        provider_category=[ProviderCategory.base],
+    )
+    base_handles = [m.handle for m in base_models]
+
+    assert f"test-base-llm-{test_id}/gpt-4o" in base_handles
+
+
+@pytest.mark.asyncio
+async def test_server_list_llm_models_byok_from_provider_api(default_user, provider_manager):
+    """Test that server.list_llm_models_async fetches BYOK models from provider API, not DB.
+
+    Note: BYOK models are fetched by calling the provider's list_llm_models_async() method,
+    which hits the actual provider API. This test uses mocking to verify that flow.
+    """
+    from letta.schemas.providers import Provider
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create a BYOK provider (but don't sync models to DB - they come from API)
+    byok_provider_create = ProviderCreate(
+        name=f"test-byok-llm-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-byok-key",
+    )
+    byok_provider = await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Create server
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    server._enabled_providers = []
+
+    # Mock the BYOK provider's list_llm_models_async to return test models
+    mock_byok_models = [
+        LLMConfig(
+            model=f"byok-gpt-4o-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://custom.openai.com/v1",
+            context_window=64000,
+            handle=f"test-byok-llm-{test_id}/gpt-4o",
+            provider_name=byok_provider.name,
+            provider_category=ProviderCategory.byok,
+        )
+    ]
+
+    # Create a mock typed provider that returns our test models
+    mock_typed_provider = MagicMock()
+    mock_typed_provider.list_llm_models_async = AsyncMock(return_value=mock_byok_models)
+    mock_typed_provider.list_embedding_models_async = AsyncMock(return_value=[])
+
+    # Patch cast_to_subtype on the Provider class to return our mock
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider):
+        # List BYOK models - should call provider API via cast_to_subtype().list_llm_models_async()
+        byok_models = await server.list_llm_models_async(
+            actor=default_user,
+            provider_category=[ProviderCategory.byok],
+        )
+
+        # Verify the mock was called (proving we hit provider API, not DB)
+        mock_typed_provider.list_llm_models_async.assert_called()
+
+        # Verify we got the mocked models back
+        byok_handles = [m.handle for m in byok_models]
+        assert f"test-byok-llm-{test_id}/gpt-4o" in byok_handles
+
+
+@pytest.mark.asyncio
+async def test_server_list_embedding_models_base_from_db(default_user, provider_manager):
+    """Test that server.list_embedding_models_async fetches base models from database.
+
+    Note: Similar to LLM models, base embedding models are stored in DB while BYOK
+    embedding models would be fetched from provider API.
+    """
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create base provider and embedding models (these ARE stored in DB)
+    base_provider_create = ProviderCreate(
+        name=f"test-base-embed-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-base-key",
+    )
+    base_provider = await provider_manager.create_provider_async(base_provider_create, actor=default_user, is_byok=False)
+
+    base_embedding_model = EmbeddingConfig(
+        embedding_model=f"base-text-embedding-{test_id}",
+        embedding_endpoint_type="openai",
+        embedding_endpoint="https://api.openai.com/v1",
+        embedding_dim=1536,
+        embedding_chunk_size=300,
+        handle=f"test-base-embed-{test_id}/text-embedding-3-small",
+    )
+
+    await provider_manager.sync_provider_models_async(
+        provider=base_provider,
+        llm_models=[],
+        embedding_models=[base_embedding_model],
+        organization_id=None,
+    )
+
+    # Create server and list models
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    server._enabled_providers = []
+
+    # List all embedding models - base models come from DB
+    all_models = await server.list_embedding_models_async(actor=default_user)
+    all_handles = [m.handle for m in all_models]
+
+    assert f"test-base-embed-{test_id}/text-embedding-3-small" in all_handles
+
+
+@pytest.mark.asyncio
+async def test_provider_ordering_matches_constants(default_user, provider_manager):
+    """Test that provider ordering in model listing matches PROVIDER_ORDER in constants."""
+    from letta.constants import PROVIDER_ORDER
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create providers with different names that should have different ordering
+    providers_to_create = [
+        ("zai", ProviderType.zai, 14),  # Lower priority
+        ("openai", ProviderType.openai, 1),  # Higher priority
+        ("anthropic", ProviderType.anthropic, 2),  # Medium priority
+    ]
+
+    created_providers = []
+    for name_suffix, provider_type, expected_order in providers_to_create:
+        provider_create = ProviderCreate(
+            name=f"{name_suffix}",  # Use actual provider name for ordering
+            provider_type=provider_type,
+            api_key=f"sk-{name_suffix}-key",
+        )
+        # Check if provider already exists
+        existing = await provider_manager.list_providers_async(name=name_suffix, actor=default_user)
+        if not existing:
+            provider = await provider_manager.create_provider_async(provider_create, actor=default_user, is_byok=False)
+            created_providers.append((provider, expected_order))
+
+            # Create a model for this provider
+            llm_model = LLMConfig(
+                model=f"test-model-{test_id}",
+                model_endpoint_type="openai",
+                model_endpoint="https://api.example.com/v1",
+                context_window=8192,
+                handle=f"{name_suffix}/test-model-{test_id}",
+                provider_name=provider.name,
+                provider_category=ProviderCategory.base,
+            )
+
+            await provider_manager.sync_provider_models_async(
+                provider=provider,
+                llm_models=[llm_model],
+                embedding_models=[],
+                organization_id=None,
+            )
+
+    # Verify PROVIDER_ORDER has expected values
+    assert PROVIDER_ORDER.get("openai") == 1
+    assert PROVIDER_ORDER.get("anthropic") == 2
+    assert PROVIDER_ORDER.get("zai") == 14
+
+    # Create server and verify ordering
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    server._enabled_providers = []
+
+    # List models and check ordering
+    all_models = await server.list_llm_models_async(actor=default_user)
+
+    # Filter to only our test models
+    test_models = [m for m in all_models if f"test-model-{test_id}" in m.handle]
+
+    if len(test_models) >= 2:
+        # Verify models are sorted by provider order
+        provider_names_in_order = [m.provider_name for m in test_models]
+
+        # Get the indices in PROVIDER_ORDER
+        indices = [PROVIDER_ORDER.get(name, 999) for name in provider_names_in_order]
+
+        # Verify the list is sorted by provider order
+        assert indices == sorted(indices), f"Models should be sorted by PROVIDER_ORDER, got: {provider_names_in_order}"
+
+
+@pytest.mark.asyncio
+async def test_create_agent_with_byok_handle_dynamic_fetch(default_user, provider_manager):
+    """Test that creating an agent with a BYOK model handle works via dynamic fetch.
+
+    This tests the case where BYOK models are NOT synced to the database, but are
+    instead fetched dynamically from the provider when resolving the handle.
+    This is the expected behavior after the provider models persistence refactor.
+    """
+    test_id = generate_test_id()
+    byok_provider_name = f"my-openai-byok-{test_id}"
+    model_name = "gpt-4o"
+    byok_handle = f"{byok_provider_name}/{model_name}"
+
+    # Create a BYOK OpenAI provider (do NOT sync models to DB)
+    provider_create = ProviderCreate(
+        name=byok_provider_name,
+        provider_type=ProviderType.openai,
+        api_key="sk-test-byok-key",
+    )
+    byok_provider = await provider_manager.create_provider_async(provider_create, actor=default_user, is_byok=True)
+
+    assert byok_provider.provider_category == ProviderCategory.byok
+    assert byok_provider.name == byok_provider_name
+
+    # Verify the model is NOT in the database (dynamic fetch scenario)
+    model_in_db = await provider_manager.get_model_by_handle_async(
+        handle=byok_handle,
+        actor=default_user,
+        model_type="llm",
+    )
+    assert model_in_db is None, "Model should NOT be in DB for this test (testing dynamic fetch)"
+
+    # Mock the provider's list_llm_models_async to return our test model
+    mock_llm_config = LLMConfig(
+        model=model_name,
+        model_endpoint_type="openai",
+        model_endpoint="https://api.openai.com/v1",
+        context_window=128000,
+        handle=byok_handle,
+        max_tokens=16384,
+        provider_name=byok_provider_name,
+        provider_category=ProviderCategory.byok,
+    )
+
+    # Create embedding config for the agent
+    mock_embedding_config = EmbeddingConfig(
+        embedding_model="text-embedding-3-small",
+        embedding_endpoint_type="openai",
+        embedding_endpoint="https://api.openai.com/v1",
+        embedding_dim=1536,
+        embedding_chunk_size=300,
+        handle=f"{byok_provider_name}/text-embedding-3-small",
+    )
+
+    # Initialize server
+    server = SyncServer(init_with_default_org_and_user=False)
+    await server.init_async(init_with_default_org_and_user=False)
+    server.provider_manager = provider_manager
+
+    # Mock the BYOK provider's list_llm_models_async method
+    with patch.object(
+        OpenAIProvider,
+        "list_llm_models_async",
+        new_callable=AsyncMock,
+        return_value=[mock_llm_config],
+    ):
+        with patch.object(
+            OpenAIProvider,
+            "list_embedding_models_async",
+            new_callable=AsyncMock,
+            return_value=[mock_embedding_config],
+        ):
+            # Create agent using BYOK handle - this should dynamically fetch from provider
+            agent = await server.create_agent_async(
+                request=CreateAgent(
+                    name=f"test-agent-byok-{test_id}",
+                    model=byok_handle,  # BYOK handle format: "{provider_name}/{model_name}"
+                    embedding=f"{byok_provider_name}/text-embedding-3-small",
+                ),
+                actor=default_user,
+            )
+
+            # Verify agent was created with the correct LLM config
+            assert agent is not None
+            assert agent.llm_config is not None
+            assert agent.llm_config.model == model_name
+            assert agent.llm_config.handle == byok_handle
+            assert agent.llm_config.provider_name == byok_provider_name
+            assert agent.llm_config.provider_category == ProviderCategory.byok
+            # Note: context_window comes from the actual provider's list_llm_models_async
+            # which may differ from mock if mocking doesn't take effect on instance method
+
+            # Cleanup
+            await server.agent_manager.delete_agent_async(agent_id=agent.id, actor=default_user)
+
+
+@pytest.mark.asyncio
+async def test_byok_provider_last_synced_triggers_sync_when_null(default_user, provider_manager):
+    """Test that BYOK providers with last_synced=null trigger a sync on first model listing."""
+    from letta.schemas.providers import Provider
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create a BYOK provider (last_synced will be null by default)
+    byok_provider_create = ProviderCreate(
+        name=f"test-byok-sync-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-byok-key",
+    )
+    byok_provider = await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Verify last_synced is null initially
+    assert byok_provider.last_synced is None
+
+    # Create server
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    server._enabled_providers = []
+
+    # Mock the BYOK provider's list_llm_models_async to return test models
+    mock_byok_models = [
+        LLMConfig(
+            model=f"byok-gpt-4o-{test_id}",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=64000,
+            handle=f"test-byok-sync-{test_id}/gpt-4o",
+            provider_name=byok_provider.name,
+            provider_category=ProviderCategory.byok,
+        )
+    ]
+
+    mock_typed_provider = MagicMock()
+    mock_typed_provider.list_llm_models_async = AsyncMock(return_value=mock_byok_models)
+    mock_typed_provider.list_embedding_models_async = AsyncMock(return_value=[])
+
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider):
+        # List BYOK models - should trigger sync because last_synced is null
+        await server.list_llm_models_async(
+            actor=default_user,
+            provider_category=[ProviderCategory.byok],
+        )
+
+        # Verify sync was triggered (cast_to_subtype was called to fetch from API)
+        # Note: may be called multiple times if other BYOK providers exist in DB
+        mock_typed_provider.list_llm_models_async.assert_called()
+
+    # Verify last_synced was updated for our provider
+    updated_providers = await provider_manager.list_providers_async(name=byok_provider.name, actor=default_user)
+    assert len(updated_providers) == 1
+    assert updated_providers[0].last_synced is not None
+
+    # Verify models were synced to database
+    synced_models = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+        provider_id=byok_provider.id,
+    )
+    assert len(synced_models) == 1
+    assert synced_models[0].name == f"byok-gpt-4o-{test_id}"
+
+
+@pytest.mark.asyncio
+async def test_byok_provider_last_synced_skips_sync_when_set(default_user, provider_manager):
+    """Test that BYOK providers with last_synced set skip sync and read from DB."""
+
+    from letta.schemas.providers import Provider
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create a BYOK provider
+    byok_provider_create = ProviderCreate(
+        name=f"test-byok-cached-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="sk-byok-key",
+    )
+    byok_provider = await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Manually sync models to DB
+    cached_model = LLMConfig(
+        model=f"cached-gpt-4o-{test_id}",
+        model_endpoint_type="openai",
+        model_endpoint="https://api.openai.com/v1",
+        context_window=64000,
+        handle=f"test-byok-cached-{test_id}/gpt-4o",
+        provider_name=byok_provider.name,
+        provider_category=ProviderCategory.byok,
+    )
+    await provider_manager.sync_provider_models_async(
+        provider=byok_provider,
+        llm_models=[cached_model],
+        embedding_models=[],
+        organization_id=default_user.organization_id,
+    )
+
+    # Set last_synced to indicate models are already synced
+    await provider_manager.update_provider_last_synced_async(byok_provider.id, actor=default_user)
+
+    # Create server
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    server._enabled_providers = []
+
+    # Mock cast_to_subtype - should NOT be called since last_synced is set
+    mock_typed_provider = MagicMock()
+    mock_typed_provider.list_llm_models_async = AsyncMock(return_value=[])
+    mock_typed_provider.list_embedding_models_async = AsyncMock(return_value=[])
+
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider):
+        # List BYOK models - should read from DB, not trigger sync
+        byok_models = await server.list_llm_models_async(
+            actor=default_user,
+            provider_category=[ProviderCategory.byok],
+        )
+
+        # Verify sync was NOT triggered (cast_to_subtype should not be called)
+        mock_typed_provider.list_llm_models_async.assert_not_called()
+
+    # Verify we got the cached model from DB
+    byok_handles = [m.handle for m in byok_models]
+    assert f"test-byok-cached-{test_id}/gpt-4o" in byok_handles
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_oauth_byok_resyncs_when_allowlist_expands(default_user, provider_manager):
+    """ChatGPT OAuth providers should backfill newly added hardcoded models."""
+    test_id = generate_test_id()
+    provider_name = f"test-chatgpt-oauth-{test_id}"
+
+    oauth_credentials = json.dumps(
+        {
+            "access_token": "test-access-token",
+            "refresh_token": "test-refresh-token",
+            "account_id": "test-account-id",
+            "expires_at": 4_102_444_800,  # year 2100 (seconds)
+        }
+    )
+
+    byok_provider = await provider_manager.create_provider_async(
+        ProviderCreate(
+            name=provider_name,
+            provider_type=ProviderType.chatgpt_oauth,
+            api_key=oauth_credentials,
+        ),
+        actor=default_user,
+        is_byok=True,
+    )
+
+    # Simulate a stale provider model cache that predates gpt-5.3-codex.
+    stale_models = [
+        LLMConfig(
+            model="gpt-5.2-codex",
+            model_endpoint_type="chatgpt_oauth",
+            model_endpoint="https://chatgpt.com/backend-api/codex/responses",
+            context_window=272000,
+            handle=f"{provider_name}/gpt-5.2-codex",
+            provider_name=provider_name,
+            provider_category=ProviderCategory.byok,
+        )
+    ]
+    await provider_manager.sync_provider_models_async(
+        provider=byok_provider,
+        llm_models=stale_models,
+        embedding_models=[],
+        organization_id=default_user.organization_id,
+    )
+    await provider_manager.update_provider_last_synced_async(byok_provider.id, actor=default_user)
+
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+    server._enabled_providers = []
+
+    byok_models = await server.list_llm_models_async(
+        actor=default_user,
+        provider_category=[ProviderCategory.byok],
+        provider_name=provider_name,
+    )
+
+    byok_handles = {model.handle for model in byok_models}
+    assert f"{provider_name}/gpt-5.3-codex" in byok_handles
+
+
+@pytest.mark.asyncio
+async def test_base_provider_updates_last_synced_on_sync(default_user, provider_manager):
+    """Test that base provider sync updates the last_synced timestamp."""
+
+    test_id = generate_test_id()
+
+    # Create a base provider
+    base_provider_create = ProviderCreate(
+        name=f"test-base-sync-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="",  # Base providers don't store API keys
+    )
+    base_provider = await provider_manager.create_provider_async(base_provider_create, actor=default_user, is_byok=False)
+
+    # Verify last_synced is null initially
+    assert base_provider.last_synced is None
+
+    # Sync models for the base provider
+    base_model = LLMConfig(
+        model=f"base-gpt-4o-{test_id}",
+        model_endpoint_type="openai",
+        model_endpoint="https://api.openai.com/v1",
+        context_window=64000,
+        handle=f"test-base-sync-{test_id}/gpt-4o",
+    )
+    await provider_manager.sync_provider_models_async(
+        provider=base_provider,
+        llm_models=[base_model],
+        embedding_models=[],
+        organization_id=None,
+    )
+    await provider_manager.update_provider_last_synced_async(base_provider.id, actor=default_user)
+
+    # Verify last_synced was updated
+    updated_providers = await provider_manager.list_providers_async(name=base_provider.name, actor=default_user)
+    assert len(updated_providers) == 1
+    assert updated_providers[0].last_synced is not None
+
+
+@pytest.mark.asyncio
+async def test_byok_provider_models_synced_on_creation(default_user, provider_manager):
+    """Test that models are automatically synced when a BYOK provider is created.
+
+    When create_provider_async is called with is_byok=True, it should:
+    1. Create the provider in the database
+    2. Call _sync_default_models_for_provider to fetch and persist models from the provider API
+    3. Update last_synced timestamp
+    """
+    from letta.schemas.providers import Provider
+
+    test_id = generate_test_id()
+
+    # Mock models that the provider API would return
+    mock_llm_models = [
+        LLMConfig(
+            model="gpt-4o",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-byok-creation-{test_id}/gpt-4o",
+            provider_name=f"test-byok-creation-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+        LLMConfig(
+            model="gpt-4o-mini",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-byok-creation-{test_id}/gpt-4o-mini",
+            provider_name=f"test-byok-creation-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+    ]
+    mock_embedding_models = [
+        EmbeddingConfig(
+            embedding_model="text-embedding-3-small",
+            embedding_endpoint_type="openai",
+            embedding_endpoint="https://api.openai.com/v1",
+            embedding_dim=1536,
+            embedding_chunk_size=300,
+            handle=f"test-byok-creation-{test_id}/text-embedding-3-small",
+        ),
+    ]
+
+    # Create a mock typed provider that returns our test models
+    mock_typed_provider = MagicMock()
+    mock_typed_provider.list_llm_models_async = AsyncMock(return_value=mock_llm_models)
+    mock_typed_provider.list_embedding_models_async = AsyncMock(return_value=mock_embedding_models)
+
+    # Patch cast_to_subtype to return our mock when _sync_default_models_for_provider is called
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider):
+        # Create the BYOK provider - this should automatically sync models
+        byok_provider_create = ProviderCreate(
+            name=f"test-byok-creation-{test_id}",
+            provider_type=ProviderType.openai,
+            api_key="sk-test-key",
+        )
+        byok_provider = await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+        # Verify the provider API was called during creation
+        mock_typed_provider.list_llm_models_async.assert_called_once()
+        mock_typed_provider.list_embedding_models_async.assert_called_once()
+
+    # Re-fetch the provider to get the updated last_synced value
+    # (the returned object from create_provider_async is stale since last_synced is set after)
+    byok_provider = await provider_manager.get_provider_async(byok_provider.id, default_user)
+
+    # Verify last_synced was set (indicating sync completed)
+    assert byok_provider.last_synced is not None
+
+    # Verify LLM models were persisted to the database
+    synced_llm_models = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+        provider_id=byok_provider.id,
+    )
+    assert len(synced_llm_models) == 2
+    synced_llm_names = {m.name for m in synced_llm_models}
+    assert "gpt-4o" in synced_llm_names
+    assert "gpt-4o-mini" in synced_llm_names
+
+    # Verify embedding models were persisted to the database
+    synced_embedding_models = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="embedding",
+        provider_id=byok_provider.id,
+    )
+    assert len(synced_embedding_models) == 1
+    assert synced_embedding_models[0].name == "text-embedding-3-small"
+
+
+@pytest.mark.asyncio
+async def test_refresh_byok_provider_adds_new_models(default_user, provider_manager):
+    """Test that refreshing a BYOK provider adds new models from the provider API.
+
+    When _sync_default_models_for_provider is called (via refresh endpoint):
+    1. It should fetch current models from the provider API
+    2. Add any new models that weren't previously synced
+    3. Update the last_synced timestamp
+    """
+    from letta.schemas.providers import Provider
+
+    test_id = generate_test_id()
+
+    # Initial models when provider is created
+    initial_models = [
+        LLMConfig(
+            model="gpt-4o",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-refresh-add-{test_id}/gpt-4o",
+            provider_name=f"test-refresh-add-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+    ]
+
+    # Updated models after refresh (includes a new model)
+    updated_models = [
+        LLMConfig(
+            model="gpt-4o",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-refresh-add-{test_id}/gpt-4o",
+            provider_name=f"test-refresh-add-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+        LLMConfig(
+            model="gpt-4.1",  # New model added by provider
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=256000,
+            handle=f"test-refresh-add-{test_id}/gpt-4.1",
+            provider_name=f"test-refresh-add-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+    ]
+
+    # Create mock for initial sync during provider creation
+    mock_typed_provider_initial = MagicMock()
+    mock_typed_provider_initial.list_llm_models_async = AsyncMock(return_value=initial_models)
+    mock_typed_provider_initial.list_embedding_models_async = AsyncMock(return_value=[])
+
+    # Create the provider with initial models
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider_initial):
+        byok_provider_create = ProviderCreate(
+            name=f"test-refresh-add-{test_id}",
+            provider_type=ProviderType.openai,
+            api_key="sk-test-key",
+        )
+        byok_provider = await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Re-fetch the provider to get the updated last_synced value
+    byok_provider = await provider_manager.get_provider_async(byok_provider.id, default_user)
+
+    # Verify initial sync - should have 1 model
+    initial_synced_models = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+        provider_id=byok_provider.id,
+    )
+    assert len(initial_synced_models) == 1
+    assert initial_synced_models[0].name == "gpt-4o"
+
+    initial_last_synced = byok_provider.last_synced
+    assert initial_last_synced is not None  # Verify sync happened during creation
+
+    # Create mock for refresh with updated models
+    mock_typed_provider_refresh = MagicMock()
+    mock_typed_provider_refresh.list_llm_models_async = AsyncMock(return_value=updated_models)
+    mock_typed_provider_refresh.list_embedding_models_async = AsyncMock(return_value=[])
+
+    # Refresh the provider (simulating what the endpoint does)
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider_refresh):
+        await provider_manager._sync_default_models_for_provider(byok_provider, default_user)
+
+    # Verify the API was called during refresh
+    mock_typed_provider_refresh.list_llm_models_async.assert_called_once()
+
+    # Verify new model was added
+    refreshed_models = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+        provider_id=byok_provider.id,
+    )
+    assert len(refreshed_models) == 2
+    refreshed_names = {m.name for m in refreshed_models}
+    assert "gpt-4o" in refreshed_names
+    assert "gpt-4.1" in refreshed_names
+
+    # Verify last_synced was updated
+    updated_provider = await provider_manager.get_provider_async(byok_provider.id, default_user)
+    assert updated_provider.last_synced is not None
+    assert updated_provider.last_synced >= initial_last_synced
+
+
+@pytest.mark.asyncio
+async def test_refresh_byok_provider_removes_old_models(default_user, provider_manager):
+    """Test that refreshing a BYOK provider removes models no longer available from the provider API.
+
+    When _sync_default_models_for_provider is called (via refresh endpoint):
+    1. It should fetch current models from the provider API
+    2. Remove any models that are no longer available (soft delete)
+    3. Keep models that are still available
+    """
+    from letta.schemas.providers import Provider
+
+    test_id = generate_test_id()
+
+    # Initial models when provider is created (includes a model that will be removed)
+    initial_models = [
+        LLMConfig(
+            model="gpt-4o",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-refresh-remove-{test_id}/gpt-4o",
+            provider_name=f"test-refresh-remove-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+        LLMConfig(
+            model="gpt-4-turbo",  # This model will be deprecated/removed
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-refresh-remove-{test_id}/gpt-4-turbo",
+            provider_name=f"test-refresh-remove-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+    ]
+
+    # Updated models after refresh (gpt-4-turbo is no longer available)
+    updated_models = [
+        LLMConfig(
+            model="gpt-4o",
+            model_endpoint_type="openai",
+            model_endpoint="https://api.openai.com/v1",
+            context_window=128000,
+            handle=f"test-refresh-remove-{test_id}/gpt-4o",
+            provider_name=f"test-refresh-remove-{test_id}",
+            provider_category=ProviderCategory.byok,
+        ),
+    ]
+
+    # Create mock for initial sync during provider creation
+    mock_typed_provider_initial = MagicMock()
+    mock_typed_provider_initial.list_llm_models_async = AsyncMock(return_value=initial_models)
+    mock_typed_provider_initial.list_embedding_models_async = AsyncMock(return_value=[])
+
+    # Create the provider with initial models
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider_initial):
+        byok_provider_create = ProviderCreate(
+            name=f"test-refresh-remove-{test_id}",
+            provider_type=ProviderType.openai,
+            api_key="sk-test-key",
+        )
+        byok_provider = await provider_manager.create_provider_async(byok_provider_create, actor=default_user, is_byok=True)
+
+    # Verify initial sync - should have 2 models
+    initial_synced_models = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+        provider_id=byok_provider.id,
+    )
+    assert len(initial_synced_models) == 2
+    initial_names = {m.name for m in initial_synced_models}
+    assert "gpt-4o" in initial_names
+    assert "gpt-4-turbo" in initial_names
+
+    # Create mock for refresh with fewer models
+    mock_typed_provider_refresh = MagicMock()
+    mock_typed_provider_refresh.list_llm_models_async = AsyncMock(return_value=updated_models)
+    mock_typed_provider_refresh.list_embedding_models_async = AsyncMock(return_value=[])
+
+    # Refresh the provider (simulating what the endpoint does)
+    with patch.object(Provider, "cast_to_subtype", return_value=mock_typed_provider_refresh):
+        await provider_manager._sync_default_models_for_provider(byok_provider, default_user)
+
+    # Verify the removed model is no longer in the list
+    refreshed_models = await provider_manager.list_models_async(
+        actor=default_user,
+        model_type="llm",
+        provider_id=byok_provider.id,
+    )
+    assert len(refreshed_models) == 1
+    assert refreshed_models[0].name == "gpt-4o"
+
+    # Verify gpt-4-turbo was removed (soft deleted)
+    refreshed_names = {m.name for m in refreshed_models}
+    assert "gpt-4-turbo" not in refreshed_names
+
+
+@pytest.mark.asyncio
+async def test_refresh_base_provider_fails(default_user, provider_manager):
+    """Test that attempting to refresh a base provider returns an error.
+
+    The refresh endpoint should only work for BYOK providers, not base providers.
+    Base providers are managed by environment variables and shouldn't be refreshed.
+    """
+    from fastapi import HTTPException
+
+    from letta.server.rest_api.routers.v1.providers import refresh_provider_models
+    from letta.server.server import SyncServer
+
+    test_id = generate_test_id()
+
+    # Create a base provider
+    base_provider_create = ProviderCreate(
+        name=f"test-base-refresh-{test_id}",
+        provider_type=ProviderType.openai,
+        api_key="",  # Base providers don't store API keys
+    )
+    base_provider = await provider_manager.create_provider_async(base_provider_create, actor=default_user, is_byok=False)
+
+    # Verify it's a base provider
+    assert base_provider.provider_category == ProviderCategory.base
+
+    # Create a mock server
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.provider_manager = provider_manager
+
+    # Create mock headers
+    mock_headers = MagicMock()
+    mock_headers.actor_id = default_user.id
+
+    # Mock get_actor_or_default_async to return our test user
+    server.user_manager = MagicMock()
+    server.user_manager.get_actor_or_default_async = AsyncMock(return_value=default_user)
+
+    # Attempt to refresh the base provider - should raise HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        await refresh_provider_models(
+            provider_id=base_provider.id,
+            headers=mock_headers,
+            server=server,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "BYOK" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_model_by_handle_prioritizes_byok_over_base(default_user, provider_manager):
+    """Test that get_model_by_handle_async returns the BYOK model when both BYOK and base providers have the same handle.
+
+    This tests the legacy scenario where a user has both a BYOK provider and a base provider
+    with the same name (and thus models with the same handle). The BYOK model should be
+    returned because it's organization-specific, while base models are global.
+    """
+    test_id = generate_test_id()
+    provider_name = f"test-duplicate-{test_id}"
+    model_handle = f"{provider_name}/gpt-4o"
+
+    # Step 1: Create a base provider and sync a model for it (global, organization_id=None)
+    base_provider_create = ProviderCreate(
+        name=provider_name,
+        provider_type=ProviderType.openai,
+        api_key="",  # Base providers don't store API keys
+    )
+    base_provider = await provider_manager.create_provider_async(base_provider_create, actor=default_user, is_byok=False)
+    assert base_provider.provider_category == ProviderCategory.base
+
+    # Sync a model for the base provider (global model with organization_id=None)
+    base_llm_model = LLMConfig(
+        model="gpt-4o",
+        model_endpoint_type="openai",
+        model_endpoint="https://api.openai.com/v1",
+        context_window=128000,
+        handle=model_handle,
+        provider_name=provider_name,
+    )
+    await provider_manager.sync_provider_models_async(
+        provider=base_provider,
+        llm_models=[base_llm_model],
+        embedding_models=[],
+        organization_id=None,  # Global model
+    )
+
+    # Verify base model was created
+    base_model = await provider_manager.get_model_by_handle_async(
+        handle=model_handle,
+        actor=default_user,
+        model_type="llm",
+    )
+    assert base_model is not None
+    assert base_model.handle == model_handle
+    assert base_model.organization_id is None  # Global model
+
+    # Step 2: Create a BYOK provider with the same name (simulating legacy duplicate)
+    # Note: In production, this is now prevented, but legacy data could have this
+    # We need to bypass the name conflict check for this test (simulating legacy data)
+    # Create the BYOK provider directly by manipulating the database
+    from letta.orm.provider import Provider as ProviderORM
+    from letta.schemas.providers import Provider as PydanticProvider
+    from letta.server.db import db_registry
+
+    # Create a pydantic provider first to generate an ID
+    byok_pydantic_provider = PydanticProvider(
+        name=provider_name,  # Same name as base provider
+        provider_type=ProviderType.openai,
+        provider_category=ProviderCategory.byok,
+        organization_id=default_user.organization_id,
+    )
+    byok_pydantic_provider.resolve_identifier()
+
+    async with db_registry.async_session() as session:
+        byok_provider_orm = ProviderORM(**byok_pydantic_provider.model_dump(to_orm=True))
+        await byok_provider_orm.create_async(session, actor=default_user)
+        byok_provider = byok_provider_orm.to_pydantic()
+
+    assert byok_provider.provider_category == ProviderCategory.byok
+
+    # Sync a model for the BYOK provider (org-specific model)
+    byok_llm_model = LLMConfig(
+        model="gpt-4o",
+        model_endpoint_type="openai",
+        model_endpoint="https://api.openai.com/v1",
+        context_window=128000,
+        handle=model_handle,  # Same handle as base model
+        provider_name=provider_name,
+        provider_category=ProviderCategory.byok,
+    )
+    await provider_manager.sync_provider_models_async(
+        provider=byok_provider,
+        llm_models=[byok_llm_model],
+        embedding_models=[],
+        organization_id=default_user.organization_id,  # Org-specific model
+    )
+
+    # Step 3: Verify that get_model_by_handle_async returns the BYOK model (org-specific)
+    retrieved_model = await provider_manager.get_model_by_handle_async(
+        handle=model_handle,
+        actor=default_user,
+        model_type="llm",
+    )
+
+    assert retrieved_model is not None
+    assert retrieved_model.handle == model_handle
+    # The key assertion: org-specific (BYOK) model should be returned, not the global (base) model
+    assert retrieved_model.organization_id == default_user.organization_id
+    assert retrieved_model.provider_id == byok_provider.id
+
+
+@pytest.mark.asyncio
+async def test_byok_provider_uses_schema_default_base_url(default_user, provider_manager):
+    """Test that BYOK providers with schema-default base_url get correct model_endpoint.
+
+    This tests a bug where providers like ZAI have a schema-default base_url
+    (e.g., "https://api.z.ai/api/paas/v4/") that isn't stored in the database.
+    When list_llm_models_async reads from DB, the base_url is NULL, and if the code
+    uses provider.base_url directly instead of typed_provider.base_url, the
+    model_endpoint would be None/wrong, causing requests to go to the wrong endpoint.
+
+    The fix uses cast_to_subtype() to get the typed provider with schema defaults.
+    """
+    from letta.orm.provider import Provider as ProviderORM
+    from letta.schemas.providers import Provider as PydanticProvider
+    from letta.server.db import db_registry
+
+    test_id = generate_test_id()
+    provider_name = f"test-zai-{test_id}"
+
+    # Create a ZAI BYOK provider WITHOUT explicitly setting base_url
+    # This simulates what happens when a user creates a ZAI provider via the API
+    # The schema default "https://api.z.ai/api/paas/v4/" applies in memory but
+    # may not be stored in the database (base_url column is NULL)
+    byok_pydantic_provider = PydanticProvider(
+        name=provider_name,
+        provider_type=ProviderType.zai,
+        provider_category=ProviderCategory.byok,
+        organization_id=default_user.organization_id,
+        # NOTE: base_url is intentionally NOT set - this is the bug scenario
+        # The DB will have base_url=NULL
+    )
+    byok_pydantic_provider.resolve_identifier()
+
+    async with db_registry.async_session() as session:
+        byok_provider_orm = ProviderORM(**byok_pydantic_provider.model_dump(to_orm=True))
+        await byok_provider_orm.create_async(session, actor=default_user)
+        byok_provider = byok_provider_orm.to_pydantic()
+
+    # Verify base_url is None in the provider loaded from DB
+    assert byok_provider.base_url is None, "base_url should be NULL in DB for this test"
+    assert byok_provider.provider_type == ProviderType.zai
+
+    # Sync a model for the provider (simulating what happens after provider creation)
+    # Set last_synced so the server reads from DB instead of calling provider API
+    from datetime import datetime, timezone
+
+    async with db_registry.async_session() as session:
+        provider_orm = await ProviderORM.read_async(session, identifier=byok_provider.id, actor=None)
+        provider_orm.last_synced = datetime.now(timezone.utc)
+        await session.commit()
+
+    model_handle = f"{provider_name}/glm-4-flash"
+    byok_llm_model = LLMConfig(
+        model="glm-4-flash",
+        model_endpoint_type="zai",
+        model_endpoint="https://api.z.ai/api/paas/v4/",  # The correct endpoint
+        context_window=128000,
+        handle=model_handle,
+        provider_name=provider_name,
+        provider_category=ProviderCategory.byok,
+    )
+    await provider_manager.sync_provider_models_async(
+        provider=byok_provider,
+        llm_models=[byok_llm_model],
+        embedding_models=[],
+        organization_id=default_user.organization_id,
+    )
+
+    # Create server and list LLM models
+    server = SyncServer(init_with_default_org_and_user=False)
+    server.default_user = default_user
+    server.provider_manager = provider_manager
+
+    # List LLM models - this should use typed_provider.base_url (schema default)
+    # NOT provider.base_url (which is NULL in DB)
+    models = await server.list_llm_models_async(
+        actor=default_user,
+        provider_category=[ProviderCategory.byok],  # Only BYOK providers
+    )
+
+    # Find our ZAI model
+    zai_models = [m for m in models if m.handle == model_handle]
+    assert len(zai_models) == 1, f"Expected 1 ZAI model, got {len(zai_models)}"
+
+    zai_model = zai_models[0]
+
+    # THE KEY ASSERTION: model_endpoint should be the ZAI schema default,
+    # NOT None (which would cause requests to go to OpenAI's endpoint)
+    expected_endpoint = "https://api.z.ai/api/paas/v4/"
+    assert zai_model.model_endpoint == expected_endpoint, (
+        f"model_endpoint should be '{expected_endpoint}' from ZAI schema default, "
+        f"but got '{zai_model.model_endpoint}'. This indicates the bug where "
+        f"provider.base_url (NULL from DB) was used instead of typed_provider.base_url."
+    )

@@ -2,18 +2,20 @@ import json
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
+import httpx
 from anthropic.types.beta.messages import BetaMessageBatch
 from openai import AsyncStream, Stream
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
-from letta.errors import LLMError
+from letta.errors import ErrorCode, LLMConnectionError, LLMError
 from letta.otel.tracing import log_event, trace_method
 from letta.schemas.embedding_config import EmbeddingConfig
-from letta.schemas.enums import AgentType, ProviderCategory
+from letta.schemas.enums import AgentType, LLMCallType, ProviderCategory
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse
-from letta.schemas.provider_trace import ProviderTraceCreate
+from letta.schemas.provider_trace import BillingContext, ProviderTrace
+from letta.schemas.usage import LettaUsageStatistics
 from letta.services.telemetry_manager import TelemetryManager
 from letta.settings import settings
 
@@ -36,9 +38,166 @@ class LLMClientBase:
         self.actor = actor
         self.put_inner_thoughts_first = put_inner_thoughts_first
         self.use_tool_naming = use_tool_naming
+        self._telemetry_manager: Optional["TelemetryManager"] = None
+        self._telemetry_agent_id: Optional[str] = None
+        self._telemetry_agent_tags: Optional[List[str]] = None
+        self._telemetry_run_id: Optional[str] = None
+        self._telemetry_step_id: Optional[str] = None
+        self._telemetry_call_type: Optional[str] = None
+        self._telemetry_org_id: Optional[str] = None
+        self._telemetry_user_id: Optional[str] = None
+        self._telemetry_compaction_settings: Optional[Dict] = None
+        self._telemetry_llm_config: Optional[Dict] = None
+        self._telemetry_billing_context: Optional[BillingContext] = None
+
+    def set_telemetry_context(
+        self,
+        telemetry_manager: Optional["TelemetryManager"] = None,
+        agent_id: Optional[str] = None,
+        agent_tags: Optional[List[str]] = None,
+        run_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        call_type: Optional[str] = None,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        compaction_settings: Optional[Dict] = None,
+        llm_config: Optional[Dict] = None,
+        actor: Optional["User"] = None,
+        billing_context: Optional[BillingContext] = None,
+    ) -> None:
+        """Set telemetry context for provider trace logging."""
+        if actor is not None:
+            self.actor = actor
+        self._telemetry_manager = telemetry_manager
+        self._telemetry_agent_id = agent_id
+        self._telemetry_agent_tags = agent_tags
+        self._telemetry_run_id = run_id
+        self._telemetry_step_id = step_id
+        self._telemetry_call_type = call_type
+        self._telemetry_org_id = org_id
+        self._telemetry_user_id = user_id
+        self._telemetry_compaction_settings = compaction_settings
+        self._telemetry_llm_config = llm_config
+        self._telemetry_billing_context = billing_context
+
+    def extract_usage_statistics(self, response_data: Optional[dict], llm_config: LLMConfig) -> LettaUsageStatistics:
+        """Provider-specific usage parsing hook (override in subclasses). Returns LettaUsageStatistics."""
+        return LettaUsageStatistics()
+
+    async def request_async_with_telemetry(self, request_data: dict, llm_config: LLMConfig) -> dict:
+        """Wrapper around request_async that logs telemetry for all requests including errors.
+
+        Call set_telemetry_context() first to set agent_id, run_id, etc.
+
+        Telemetry is logged via TelemetryManager which supports multiple backends
+        (postgres, clickhouse, socket, etc.) configured via
+        LETTA_TELEMETRY_PROVIDER_TRACE_BACKEND.
+        """
+        from letta.log import get_logger
+
+        logger = get_logger(__name__)
+        response_data = None
+        error_msg = None
+        error_type = None
+        try:
+            response_data = await self.request_async(request_data, llm_config)
+            return response_data
+        except Exception as e:
+            error_msg = str(e)
+            error_type = type(e).__name__
+            raise
+        finally:
+            # Log telemetry via configured backends
+            if self._telemetry_manager and settings.track_provider_trace:
+                if self.actor is None:
+                    logger.warning(f"Skipping telemetry: actor is None (call_type={self._telemetry_call_type})")
+                else:
+                    try:
+                        pydantic_actor = self.actor.to_pydantic() if hasattr(self.actor, "to_pydantic") else self.actor
+                        await self._telemetry_manager.create_provider_trace_async(
+                            actor=pydantic_actor,
+                            provider_trace=ProviderTrace(
+                                request_json=request_data,
+                                response_json=response_data if response_data else {"error": error_msg, "error_type": error_type},
+                                step_id=self._telemetry_step_id,
+                                agent_id=self._telemetry_agent_id,
+                                agent_tags=self._telemetry_agent_tags,
+                                run_id=self._telemetry_run_id,
+                                call_type=self._telemetry_call_type,
+                                org_id=self._telemetry_org_id,
+                                user_id=self._telemetry_user_id,
+                                compaction_settings=self._telemetry_compaction_settings,
+                                llm_config=llm_config.model_dump() if llm_config else self._telemetry_llm_config,
+                                billing_context=self._telemetry_billing_context,
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to log telemetry: {e}")
+
+    async def log_provider_trace_async(
+        self,
+        request_data: dict,
+        response_json: Optional[dict],
+        llm_config: Optional[LLMConfig] = None,
+        latency_ms: Optional[int] = None,
+        error_msg: Optional[str] = None,
+        error_type: Optional[str] = None,
+    ) -> None:
+        """Log provider trace telemetry. Call after processing LLM response.
+
+        Uses telemetry context set via set_telemetry_context().
+        Telemetry is logged via TelemetryManager which supports multiple backends.
+
+        Args:
+            request_data: The request payload sent to the LLM
+            response_json: The response payload from the LLM
+            llm_config: LLMConfig for extracting provider/model info
+            latency_ms: Latency in milliseconds (not used currently, kept for API compatibility)
+            error_msg: Error message if request failed (not used currently)
+            error_type: Error type if request failed (not used currently)
+        """
+        from letta.log import get_logger
+
+        logger = get_logger(__name__)
+
+        if not self._telemetry_manager or not settings.track_provider_trace:
+            return
+
+        if self.actor is None:
+            logger.warning(f"Skipping telemetry: actor is None (call_type={self._telemetry_call_type})")
+            return
+
+        if response_json is None:
+            if error_msg:
+                response_json = {"error": error_msg, "error_type": error_type}
+            else:
+                logger.warning(f"Skipping telemetry: no response_json or error_msg (call_type={self._telemetry_call_type})")
+                return
+
+        try:
+            pydantic_actor = self.actor.to_pydantic() if hasattr(self.actor, "to_pydantic") else self.actor
+            await self._telemetry_manager.create_provider_trace_async(
+                actor=pydantic_actor,
+                provider_trace=ProviderTrace(
+                    request_json=request_data,
+                    response_json=response_json,
+                    step_id=self._telemetry_step_id,
+                    agent_id=self._telemetry_agent_id,
+                    agent_tags=self._telemetry_agent_tags,
+                    run_id=self._telemetry_run_id,
+                    call_type=self._telemetry_call_type,
+                    org_id=self._telemetry_org_id,
+                    user_id=self._telemetry_user_id,
+                    compaction_settings=self._telemetry_compaction_settings,
+                    llm_config=llm_config.model_dump() if llm_config else self._telemetry_llm_config,
+                    billing_context=self._telemetry_billing_context,
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log telemetry: {e}")
 
     @trace_method
-    def send_llm_request(
+    async def send_llm_request(
         self,
         agent_type: AgentType,
         messages: List[Message],
@@ -66,21 +225,22 @@ class LLMClientBase:
 
         try:
             log_event(name="llm_request_sent", attributes=request_data)
-            response_data = self.request(request_data, llm_config)
+            response_data = await self.request_async(request_data, llm_config)
             if step_id and telemetry_manager:
                 telemetry_manager.create_provider_trace(
                     actor=self.actor,
-                    provider_trace_create=ProviderTraceCreate(
+                    provider_trace=ProviderTrace(
                         request_json=request_data,
                         response_json=response_data,
                         step_id=step_id,
+                        call_type=LLMCallType.agent_step,
                     ),
                 )
             log_event(name="llm_response_received", attributes=response_data)
         except Exception as e:
-            raise self.handle_llm_error(e)
+            raise self.handle_llm_error(e, llm_config=llm_config)
 
-        return self.convert_response_to_chat_completion(response_data, messages, llm_config)
+        return await self.convert_response_to_chat_completion(response_data, messages, llm_config)
 
     @trace_method
     async def send_llm_request_async(
@@ -103,18 +263,19 @@ class LLMClientBase:
             if settings.track_provider_trace and telemetry_manager:
                 await telemetry_manager.create_provider_trace_async(
                     actor=self.actor,
-                    provider_trace_create=ProviderTraceCreate(
+                    provider_trace=ProviderTrace(
                         request_json=request_data,
                         response_json=response_data,
                         step_id=step_id,
+                        call_type=LLMCallType.agent_step,
                     ),
                 )
 
             log_event(name="llm_response_received", attributes=response_data)
         except Exception as e:
-            raise self.handle_llm_error(e)
+            raise self.handle_llm_error(e, llm_config=llm_config)
 
-        return self.convert_response_to_chat_completion(response_data, messages, llm_config)
+        return await self.convert_response_to_chat_completion(response_data, messages, llm_config)
 
     async def send_llm_batch_request_async(
         self,
@@ -138,6 +299,7 @@ class LLMClientBase:
         force_tool_call: Optional[str] = None,
         requires_subsequent_tool_call: bool = False,
         tool_return_truncation_chars: Optional[int] = None,
+        system: Optional[str] = None,
     ) -> dict:
         """
         Constructs a request object in the expected data format for this client.
@@ -177,7 +339,7 @@ class LLMClientBase:
         raise NotImplementedError
 
     @abstractmethod
-    def convert_response_to_chat_completion(
+    async def convert_response_to_chat_completion(
         self,
         response_data: dict,
         input_messages: List[Message],
@@ -204,40 +366,73 @@ class LLMClientBase:
         raise NotImplementedError
 
     @abstractmethod
-    def handle_llm_error(self, e: Exception) -> Exception:
+    def handle_llm_error(self, e: Exception, llm_config: Optional["LLMConfig"] = None) -> Exception:
         """
         Maps provider-specific errors to common LLMError types.
         Each LLM provider should implement this to translate their specific errors.
 
         Args:
             e: The original provider-specific exception
+            llm_config: Optional LLM config to determine if this is a BYOK key
 
         Returns:
             An LLMError subclass that represents the error in a provider-agnostic way
         """
-        return LLMError(f"Unhandled LLM error: {str(e)}")
+        is_byok = (llm_config.provider_category == ProviderCategory.byok) if llm_config else None
+
+        # Handle httpx.RemoteProtocolError which can occur during streaming
+        # when the remote server closes the connection unexpectedly
+        # (e.g., "peer closed connection without sending complete message body")
+        if isinstance(e, httpx.RemoteProtocolError):
+            from letta.log import get_logger
+
+            logger = get_logger(__name__)
+            logger.warning(f"[LLM] Remote protocol error during streaming: {e}")
+            return LLMConnectionError(
+                message=f"Connection error during streaming: {str(e)}",
+                code=ErrorCode.INTERNAL_SERVER_ERROR,
+                details={"cause": str(e.__cause__) if e.__cause__ else None, "is_byok": is_byok},
+            )
+
+        return LLMError(message=f"Unhandled LLM error: {str(e)}", details={"is_byok": is_byok})
 
     def get_byok_overrides(self, llm_config: LLMConfig) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """
         Returns the override key for the given llm config.
+        Only fetches API key from database for BYOK providers.
+        Base providers use environment variables directly.
         """
         api_key = None
+        # Only fetch API key from database for BYOK providers
+        # Base providers should always use environment variables
         if llm_config.provider_category == ProviderCategory.byok:
             from letta.services.provider_manager import ProviderManager
 
             api_key = ProviderManager().get_override_key(llm_config.provider_name, actor=self.actor)
+            # If we got an empty string from the database, treat it as None
+            # so the client can fall back to environment variables or default behavior
+            if api_key == "":
+                api_key = None
 
         return api_key, None, None
 
     async def get_byok_overrides_async(self, llm_config: LLMConfig) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """
         Returns the override key for the given llm config.
+        Only fetches API key from database for BYOK providers.
+        Base providers use environment variables directly.
         """
         api_key = None
+        # Only fetch API key from database for BYOK providers
+        # Base providers should always use environment variables
         if llm_config.provider_category == ProviderCategory.byok:
             from letta.services.provider_manager import ProviderManager
 
             api_key = await ProviderManager().get_override_key_async(llm_config.provider_name, actor=self.actor)
+            # If we got an empty string from the database, treat it as None
+            # so the client can fall back to environment variables or default behavior
+            if api_key == "":
+                api_key = None
 
         return api_key, None, None
 

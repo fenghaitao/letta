@@ -93,9 +93,29 @@ MODEL_LIST = [
         "name": "claude-3-5-haiku-latest",
         "context_window": 200000,
     },
+    # 4.5
+    {
+        "name": "claude-haiku-4-5-20251001",
+        "context_window": 200000,
+    },
+    # 4.5 latest
+    {
+        "name": "claude-haiku-4-5-latest",
+        "context_window": 200000,
+    },
     ## Opus 4.5
     {
         "name": "claude-opus-4-5-20251101",
+        "context_window": 200000,
+    },
+    ## Opus 4.6
+    {
+        "name": "claude-opus-4-6",
+        "context_window": 200000,
+    },
+    ## Sonnet 4.6
+    {
+        "name": "claude-sonnet-4-6",
         "context_window": 200000,
     },
 ]
@@ -104,22 +124,35 @@ MODEL_LIST = [
 class AnthropicProvider(Provider):
     provider_type: Literal[ProviderType.anthropic] = Field(ProviderType.anthropic, description="The type of the provider.")
     provider_category: ProviderCategory = Field(ProviderCategory.base, description="The category of the provider (base or byok)")
-    api_key: str = Field(..., description="API key for the Anthropic API.")
+    api_key: str | None = Field(None, description="API key for the Anthropic API.", deprecated=True)
     base_url: str = "https://api.anthropic.com/v1"
 
     async def check_api_key(self):
-        api_key = self.get_api_key_secret().get_plaintext()
-        if api_key:
-            anthropic_client = anthropic.Anthropic(api_key=api_key)
-            try:
-                # just use a cheap model to count some tokens - as of 5/7/2025 this is faster than fetching the list of models
-                anthropic_client.messages.count_tokens(model=MODEL_LIST[-1]["name"], messages=[{"role": "user", "content": "a"}])
-            except anthropic.AuthenticationError as e:
-                raise LLMAuthenticationError(message=f"Failed to authenticate with Anthropic: {e}", code=ErrorCode.UNAUTHENTICATED)
-            except Exception as e:
-                raise LLMError(message=f"{e}", code=ErrorCode.INTERNAL_SERVER_ERROR)
-        else:
+        api_key = await self.api_key_enc.get_plaintext_async() if self.api_key_enc else None
+        if not api_key:
             raise ValueError("No API key provided")
+
+        try:
+            # Use async Anthropic client
+            anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
+            # just use a cheap model to count some tokens - as of 5/7/2025 this is faster than fetching the list of models
+            await anthropic_client.messages.count_tokens(model=MODEL_LIST[-1]["name"], messages=[{"role": "user", "content": "a"}])
+        except anthropic.AuthenticationError as e:
+            raise LLMAuthenticationError(message=f"Failed to authenticate with Anthropic: {e}", code=ErrorCode.UNAUTHENTICATED)
+        except Exception as e:
+            raise LLMError(message=f"{e}", code=ErrorCode.INTERNAL_SERVER_ERROR)
+
+    def get_default_max_output_tokens(self, model_name: str) -> int:
+        """Get the default max output tokens for Anthropic models."""
+        if "claude-opus-4-6" in model_name or "claude-sonnet-4-6" in model_name:
+            return 21000  # Opus 4.6 / Sonnet 4.6 supports up to 128k with streaming, use 21k as default
+        elif "opus" in model_name:
+            return 16384
+        elif "sonnet" in model_name:
+            return 16384
+        elif "haiku" in model_name:
+            return 8192
+        return 8192  # default for anthropic
 
     async def list_llm_models_async(self) -> list[LLMConfig]:
         """
@@ -127,18 +160,40 @@ class AnthropicProvider(Provider):
 
         NOTE: currently there is no GET /models, so we need to hardcode
         """
-        api_key = self.get_api_key_secret().get_plaintext()
+        api_key = await self.api_key_enc.get_plaintext_async() if self.api_key_enc else None
+
+        # For claude-pro-max provider, use OAuth Bearer token instead of api_key
+        is_oauth_provider = self.name == "claude-pro-max"
+
         if api_key:
-            anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
+            if is_oauth_provider:
+                anthropic_client = anthropic.AsyncAnthropic(
+                    default_headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "anthropic-version": "2023-06-01",
+                        "anthropic-beta": "oauth-2025-04-20",
+                    },
+                )
+            else:
+                anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
         elif model_settings.anthropic_api_key:
             anthropic_client = anthropic.AsyncAnthropic()
         else:
             raise ValueError("No API key provided")
 
-        models = await anthropic_client.models.list()
-        models_json = models.model_dump()
-        assert "data" in models_json, f"Anthropic model query response missing 'data' field: {models_json}"
-        models_data = models_json["data"]
+        try:
+            # Auto-paginate through all pages to ensure we get every model.
+            # The default page size is 20, and Anthropic now has more models than that.
+            models_data = []
+            async for model in anthropic_client.models.list():
+                models_data.append(model.model_dump())
+        except AttributeError as e:
+            if "_set_private_attributes" in str(e):
+                raise LLMError(
+                    message="Anthropic API returned an unexpected non-JSON response. Verify the API key and endpoint.",
+                    code=ErrorCode.INTERNAL_SERVER_ERROR,
+                )
+            raise
 
         return self._list_llm_models(models_data)
 
@@ -160,7 +215,7 @@ class AnthropicProvider(Provider):
                     logger.warning(f"Couldn't find context window size for model {model['id']}, defaulting to 200,000")
                     model["context_window"] = 200000
 
-            # Optional override: enable 1M context for Sonnet 4/4.5 when flag is set
+            # Optional override: enable 1M context for Sonnet 4/4.5 or Opus 4.6 when flag is set
             try:
                 from letta.settings import model_settings
 
@@ -168,14 +223,12 @@ class AnthropicProvider(Provider):
                     model["id"].startswith("claude-sonnet-4") or model["id"].startswith("claude-sonnet-4-5")
                 ):
                     model["context_window"] = 1_000_000
+                elif model_settings.anthropic_opus_1m and model["id"].startswith("claude-opus-4-6"):
+                    model["context_window"] = 1_000_000
             except Exception:
                 pass
 
-            max_tokens = 8192
-            if "claude-3-opus" in model["id"]:
-                max_tokens = 4096
-            if "claude-3-haiku" in model["id"]:
-                max_tokens = 4096
+            max_tokens = self.get_default_max_output_tokens(model["id"])
             # TODO: set for 3-7 extended thinking mode
 
             # NOTE: from 2025-02

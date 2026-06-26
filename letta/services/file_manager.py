@@ -1,4 +1,3 @@
-import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -22,7 +21,7 @@ from letta.schemas.source_metadata import FileStats, OrganizationSourcesStats, S
 from letta.schemas.user import User as PydanticUser
 from letta.server.db import db_registry
 from letta.settings import settings
-from letta.utils import enforce_types
+from letta.utils import bounded_gather, enforce_types
 from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
@@ -40,7 +39,9 @@ class DuplicateFileError(Exception):
 class FileManager:
     """Manager class to handle business logic related to files."""
 
-    async def _invalidate_file_caches(self, file_id: str, actor: PydanticUser, original_filename: str = None, source_id: str = None):
+    async def _invalidate_file_caches(
+        self, file_id: str, actor: PydanticUser, original_filename: str | None = None, source_id: str | None = None
+    ):
         """Invalidate all caches related to a file."""
         # TEMPORARILY DISABLED - caching is disabled
         # # invalidate file content cache (all variants)
@@ -85,24 +86,23 @@ class FileManager:
                 # invalidate cache for this new file
                 await self._invalidate_file_caches(file_orm.id, actor, file_orm.original_file_name, file_orm.source_id)
 
-                return await file_orm.to_pydantic_async()
+                return file_orm.to_pydantic()
 
             except IntegrityError:
                 await session.rollback()
                 return await self.get_file_by_id(file_metadata.id, actor=actor)
 
-    # TODO: We make actor optional for now, but should most likely be enforced due to security reasons
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="file_id", expected_prefix=PrimitiveType.FILE)
+    @trace_method
     # @async_redis_cache(
-    #     key_func=lambda self, file_id, actor=None, include_content=False, strip_directory_prefix=False: f"{file_id}:{actor.organization_id if actor else 'none'}:{include_content}:{strip_directory_prefix}",
+    #     key_func=lambda self, file_id, actor, include_content=False, strip_directory_prefix=False: f"{file_id}:{actor.organization_id}:{include_content}:{strip_directory_prefix}",
     #     prefix="file_content",
     #     ttl_s=3600,
     #     model_class=PydanticFileMetadata,
     # )
     async def get_file_by_id(
-        self, file_id: str, actor: Optional[PydanticUser] = None, *, include_content: bool = False, strip_directory_prefix: bool = False
+        self, file_id: str, actor: PydanticUser, *, include_content: bool = False, strip_directory_prefix: bool = False
     ) -> Optional[PydanticFileMetadata]:
         """Retrieve a file by its ID.
 
@@ -124,20 +124,26 @@ class FileManager:
                     )
 
                 result = await session.execute(query)
-                file_orm = result.scalar_one()
+                file_orm = result.scalar_one_or_none()
             else:
                 # fast path (metadata only)
-                file_orm = await FileMetadataModel.read_async(
-                    db_session=session,
-                    identifier=file_id,
-                    actor=actor,
-                )
+                try:
+                    file_orm = await FileMetadataModel.read_async(
+                        db_session=session,
+                        identifier=file_id,
+                        actor=actor,
+                    )
+                except NoResultFound:
+                    return None
+
+            if file_orm is None:
+                return None
 
             return await file_orm.to_pydantic_async(include_content=include_content, strip_directory_prefix=strip_directory_prefix)
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="file_id", expected_prefix=PrimitiveType.FILE)
+    @trace_method
     async def update_file_status(
         self,
         *,
@@ -278,7 +284,7 @@ class FileManager:
                 identifier=file_id,
                 actor=actor,
             )
-            return await file_orm.to_pydantic_async()
+            return file_orm.to_pydantic()
 
     @enforce_types
     @trace_method
@@ -354,8 +360,8 @@ class FileManager:
         return file_metadata
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="file_id", expected_prefix=PrimitiveType.FILE)
+    @trace_method
     async def upsert_file_content(
         self,
         *,
@@ -400,15 +406,15 @@ class FileManager:
             return await result.scalar_one().to_pydantic_async(include_content=True)
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
+    @trace_method
     async def list_files(
         self,
         source_id: str,
         actor: PydanticUser,
         before: Optional[str] = None,
         after: Optional[str] = None,
-        limit: Optional[int] = None,
+        limit: Optional[int] = 1000,
         ascending: Optional[bool] = True,
         include_content: bool = False,
         strip_directory_prefix: bool = False,
@@ -445,31 +451,41 @@ class FileManager:
             )
 
             # convert all files to pydantic models
-            file_metadatas = await asyncio.gather(
-                *[file.to_pydantic_async(include_content=include_content, strip_directory_prefix=strip_directory_prefix) for file in files]
-            )
-
-            # if status checking is enabled, check all files concurrently
-            if check_status_updates:
-                file_metadatas = await asyncio.gather(
-                    *[self.check_and_update_file_status(file_metadata, actor) for file_metadata in file_metadatas]
+            if include_content:
+                file_metadatas = await bounded_gather(
+                    [
+                        file.to_pydantic_async(include_content=include_content, strip_directory_prefix=strip_directory_prefix)
+                        for file in files
+                    ]
                 )
+            else:
+                file_metadatas = [file.to_pydantic(strip_directory_prefix=strip_directory_prefix) for file in files]
+
+            # if status checking is enabled, check all files sequentially to avoid db pool exhaustion
+            # Each status check may update the file in the database, so concurrent checks with many
+            # files can create too many simultaneous database connections
+            if check_status_updates:
+                updated_file_metadatas = []
+                for file_metadata in file_metadatas:
+                    updated_metadata = await self.check_and_update_file_status(file_metadata, actor)
+                    updated_file_metadatas.append(updated_metadata)
+                file_metadatas = updated_file_metadatas
 
             return file_metadatas
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="file_id", expected_prefix=PrimitiveType.FILE)
+    @trace_method
     async def delete_file(self, file_id: str, actor: PydanticUser) -> PydanticFileMetadata:
         """Delete a file by its ID."""
         async with db_registry.async_session() as session:
-            file = await FileMetadataModel.read_async(db_session=session, identifier=file_id)
+            file = await FileMetadataModel.read_async(db_session=session, identifier=file_id, actor=actor)
 
             # invalidate cache for this file before deletion
             await self._invalidate_file_caches(file_id, actor, file.original_file_name, file.source_id)
 
             await file.hard_delete_async(db_session=session, actor=actor)
-            return await file.to_pydantic_async()
+            return file.to_pydantic()
 
     @enforce_types
     @trace_method
@@ -513,8 +529,8 @@ class FileManager:
                 return f"{source.name}/{base}_({count}){ext}"
 
     @enforce_types
-    @trace_method
     @raise_on_invalid_id(param_name="source_id", expected_prefix=PrimitiveType.SOURCE)
+    @trace_method
     # @async_redis_cache(
     #     key_func=lambda self, original_filename, source_id, actor: f"{original_filename}:{source_id}:{actor.organization_id}",
     #     prefix="file_by_name",
@@ -551,7 +567,7 @@ class FileManager:
             file_orm = result.scalar_one_or_none()
 
             if file_orm:
-                return await file_orm.to_pydantic_async()
+                return file_orm.to_pydantic()
             return None
 
     @enforce_types
@@ -660,7 +676,10 @@ class FileManager:
             result = await session.execute(query)
             files_orm = result.scalars().all()
 
-            return await asyncio.gather(*[file.to_pydantic_async(include_content=include_content) for file in files_orm])
+            if include_content:
+                return await bounded_gather([file.to_pydantic_async(include_content=include_content) for file in files_orm])
+            else:
+                return [file.to_pydantic() for file in files_orm]
 
     @enforce_types
     @trace_method
@@ -683,7 +702,7 @@ class FileManager:
 
         async with db_registry.async_session() as session:
             # We need to import FileAgent here to avoid circular imports
-            from letta.orm.file_agent import FileAgent as FileAgentModel
+            from letta.orm.files_agents import FileAgent as FileAgentModel
 
             # Join through file-agent relationships
             query = (
@@ -705,4 +724,7 @@ class FileManager:
             result = await session.execute(query)
             files_orm = result.scalars().all()
 
-            return await asyncio.gather(*[file.to_pydantic_async(include_content=include_content) for file in files_orm])
+            if include_content:
+                return await bounded_gather([file.to_pydantic_async(include_content=include_content) for file in files_orm])
+            else:
+                return [file.to_pydantic() for file in files_orm]

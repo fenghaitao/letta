@@ -17,11 +17,10 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from logging import Logger
-from typing import Any, Callable, Coroutine, Optional, Union, _GenericAlias, get_args, get_origin, get_type_hints
+from typing import Any, Callable, Optional, Union, _GenericAlias, get_args, get_origin, get_type_hints  # type: ignore[attr-defined]
 from urllib.parse import urljoin, urlparse
 
 import demjson3 as demjson
-import tiktoken
 from pathvalidate import sanitize_filename as pathvalidate_sanitize_filename
 from sqlalchemy import text
 
@@ -491,6 +490,25 @@ def get_tool_call_id() -> str:
     return str(uuid.uuid4())[:TOOL_CALL_ID_MAX_LEN]
 
 
+# Pattern for valid tool_call_id (required by Anthropic: ^[a-zA-Z0-9_-]+$)
+TOOL_CALL_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def sanitize_tool_call_id(tool_id: str) -> str:
+    """Ensure tool_call_id matches cross-provider requirements:
+    - Anthropic: pattern ^[a-zA-Z0-9_-]+$
+    - OpenAI: max length 29 characters
+
+    Some models (e.g. Kimi via OpenRouter) generate IDs like 'Read:93' which
+    contain invalid characters. This sanitizes them for cross-provider compatibility.
+    """
+    # Replace invalid characters with underscores
+    if not TOOL_CALL_ID_PATTERN.match(tool_id):
+        tool_id = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_id)
+    # Truncate to max length
+    return tool_id[:TOOL_CALL_ID_MAX_LEN]
+
+
 def assistant_function_to_tool(assistant_message: dict) -> dict:
     assert "function_call" in assistant_message
     new_msg = copy.deepcopy(assistant_message)
@@ -812,13 +830,13 @@ class OpenAIBackcompatUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
-def count_tokens(s: str, model: str = "gpt-4") -> int:
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except KeyError:
-        print("Falling back to cl100k base for token counting.")
-        encoding = tiktoken.get_encoding("cl100k_base")
-    return len(encoding.encode(s))
+# def count_tokens(s: str, model: str = "gpt-4") -> int:
+#    try:
+#        encoding = tiktoken.encoding_for_model(model)
+#    except KeyError:
+#        print("Falling back to cl100k base for token counting.")
+#        encoding = tiktoken.get_encoding("cl100k_base")
+#    return len(encoding.encode(s))
 
 
 def printd(*args, **kwargs):
@@ -854,7 +872,32 @@ def parse_json(string) -> dict:
         raise e
 
 
-def validate_function_response(function_response: Any, return_char_limit: int, strict: bool = False, truncate: bool = True) -> Any:
+def parse_json_or_wrap_raw(
+    string: str,
+    wrapper_key: str = "_malformed_tool_arguments",
+    context: Optional[dict[str, Any]] = None,
+) -> dict:
+    """Parse JSON into a dict, returning a wrapped raw payload on parse failure.
+
+    This is intended for serialization paths where we prefer degraded, non-fatal behavior
+    over failing an entire run because historical tool-call args are malformed.
+    """
+    try:
+        return parse_json(string)
+    except Exception as e:
+        context = context or {}
+        logger.warning(
+            "Failed to parse JSON payload, falling back to wrapped raw payload. wrapper_key=%s error=%s context=%s",
+            wrapper_key,
+            e,
+            context,
+        )
+        return {wrapper_key: string}
+
+
+def validate_function_response(
+    function_response: Any, return_char_limit: int, strict: bool = False, truncate: bool = True
+) -> str | dict[str, Any]:
     """Check to make sure that a function used by Letta returned a valid response. Truncates to return_char_limit if necessary.
 
     This makes sure that we can coerce the function_response into a string or dict that meets our criteria. We handle some soft coercion.
@@ -1134,6 +1177,16 @@ def safe_create_task(coro, label: str = "background task"):
             f"{label}: Expected a coroutine, got {type(coro).__name__}. Make sure you're calling the async function with () parentheses."
         )
 
+    # Extract coroutine location for diagnostics
+    coro_code = getattr(coro, "cr_code", None)
+    if coro_code:
+        filename = coro_code.co_filename
+        idx = filename.find("letta/")
+        filename = filename[idx + 6 :] if idx != -1 else filename.split("/")[-1]
+        coro_name = f"{filename}:{coro_code.co_firstlineno}:{coro_code.co_name}"
+    else:
+        coro_name = "unknown"
+
     async def wrapper():
         try:
             await coro
@@ -1144,7 +1197,7 @@ def safe_create_task(coro, label: str = "background task"):
                 return
             logger.exception(f"{label} failed with {type(e).__name__}: {e}")
 
-    task = asyncio.create_task(wrapper())
+    task = asyncio.create_task(wrapper(), name=f"safe[{coro_name}]")
 
     # Add task to the set to maintain strong reference
     _background_tasks.add(task)
@@ -1160,6 +1213,16 @@ def safe_create_task(coro, label: str = "background task"):
 
 @trace_method
 def safe_create_task_with_return(coro, label: str = "background task"):
+    # Extract coroutine location for diagnostics
+    coro_code = getattr(coro, "cr_code", None)
+    if coro_code:
+        filename = coro_code.co_filename
+        idx = filename.find("letta/")
+        filename = filename[idx + 6 :] if idx != -1 else filename.split("/")[-1]
+        coro_name = f"{filename}:{coro_code.co_firstlineno}:{coro_code.co_name}"
+    else:
+        coro_name = "unknown"
+
     async def wrapper():
         try:
             return await coro
@@ -1167,7 +1230,7 @@ def safe_create_task_with_return(coro, label: str = "background task"):
             logger.exception(f"{label} failed with {type(e).__name__}: {e}")
             raise
 
-    task = asyncio.create_task(wrapper())
+    task = asyncio.create_task(wrapper(), name=f"safe_ret[{coro_name}]")
 
     # Add task to the set to maintain strong reference
     _background_tasks.add(task)
@@ -1190,6 +1253,16 @@ def safe_create_shielded_task(coro, label: str = "shielded background task"):
     returned task can still have callbacks added to it.
     """
 
+    # Extract coroutine location for diagnostics
+    coro_code = getattr(coro, "cr_code", None)
+    if coro_code:
+        filename = coro_code.co_filename
+        idx = filename.find("letta/")
+        filename = filename[idx + 6 :] if idx != -1 else filename.split("/")[-1]
+        coro_name = f"{filename}:{coro_code.co_firstlineno}:{coro_code.co_name}"
+    else:
+        coro_name = "unknown"
+
     async def shielded_wrapper():
         try:
             # Shield the original coroutine to prevent cancellation
@@ -1200,7 +1273,7 @@ def safe_create_shielded_task(coro, label: str = "shielded background task"):
             raise
 
     # Create the task with the shielded wrapper
-    task = asyncio.create_task(shielded_wrapper())
+    task = asyncio.create_task(shielded_wrapper(), name=f"safe_shield[{coro_name}]")
 
     # Add task to the set to maintain strong reference
     _background_tasks.add(task)
@@ -1257,77 +1330,6 @@ def safe_create_file_processing_task(coro, file_metadata, server, actor, logger:
     task.add_done_callback(_background_tasks.discard)
 
     return task
-
-
-class CancellationSignal:
-    """
-    A signal that can be checked for cancellation during streaming operations.
-
-    This provides a lightweight way to check if an operation should be cancelled
-    without having to pass job managers and other dependencies through every method.
-    """
-
-    def __init__(self, job_manager=None, job_id=None, actor=None):
-        from letta.log import get_logger
-        from letta.schemas.user import User
-        from letta.services.job_manager import JobManager
-
-        self.job_manager: JobManager | None = job_manager
-        self.job_id: str | None = job_id
-        self.actor: User | None = actor
-        self._is_cancelled = False
-        self.logger = get_logger(__name__)
-
-    async def is_cancelled(self) -> bool:
-        """
-        Check if the operation has been cancelled.
-
-        Returns:
-            True if cancelled, False otherwise
-        """
-        from letta.schemas.enums import JobStatus
-
-        if self._is_cancelled:
-            return True
-
-        if not self.job_manager or not self.job_id or not self.actor:
-            return False
-
-        try:
-            job = await self.job_manager.get_job_by_id_async(job_id=self.job_id, actor=self.actor)
-            self._is_cancelled = job.status == JobStatus.cancelled
-            return self._is_cancelled
-        except Exception as e:
-            self.logger.warning(f"Failed to check cancellation status for job {self.job_id}: {e}")
-            return False
-
-    def cancel(self):
-        """Mark this signal as cancelled locally (for testing or direct cancellation)."""
-        self._is_cancelled = True
-
-    async def check_and_raise_if_cancelled(self):
-        """
-        Check for cancellation and raise CancelledError if cancelled.
-
-        Raises:
-            asyncio.CancelledError: If the operation has been cancelled
-        """
-        if await self.is_cancelled():
-            self.logger.info(f"Operation cancelled for job {self.job_id}")
-            raise asyncio.CancelledError(f"Job {self.job_id} was cancelled")
-
-
-class NullCancellationSignal(CancellationSignal):
-    """A null cancellation signal that is never cancelled."""
-
-    def __init__(self):
-        super().__init__()
-
-    async def is_cancelled(self) -> bool:
-        return False
-
-    async def check_and_raise_if_cancelled(self):
-        pass
 
 
 async def get_latest_alembic_revision() -> str:
@@ -1404,7 +1406,6 @@ def fire_and_forget(coro, task_name: Optional[str] = None, error_callback: Optio
     Returns:
         The created asyncio Task object
     """
-    import traceback
 
     task = asyncio.create_task(coro)
 
@@ -1487,3 +1488,93 @@ def is_1_0_sdk_version(headers: HeaderParams):
 
     major_version = version_base.split(".")[0]
     return major_version == "1"
+
+
+async def bounded_gather(coros: list[Coroutine], max_concurrency: int = 10) -> list:
+    """
+    Execute coroutines with bounded concurrency to prevent event loop saturation.
+
+    Unlike asyncio.gather() which runs all coroutines concurrently, this limits
+    the number of concurrent tasks to prevent overwhelming the event loop.
+
+    Note: This is a stopgap measure. Prefer fixing the root cause by:
+    - Limiting items fetched from DB (e.g., pagination)
+    - Using explicit relationship loading instead of eager-loading all
+    - Adding concurrency limits at the API/business logic layer
+
+    Args:
+        coros: List of coroutines to execute
+        max_concurrency: Maximum number of concurrent tasks (default: 10)
+
+    Returns:
+        List of results in the same order as input coroutines
+    """
+    if not coros:
+        return []
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def bounded_coro(index: int, coro: Coroutine, coro_name: str):
+        # Set task name for diagnostics before acquiring semaphore
+        task = asyncio.current_task()
+        if task:
+            task.set_name(f"bounded[{coro_name}]")
+
+        async with semaphore:
+            result = await coro
+            return (index, result)
+
+    # Wrap all coroutines with semaphore control, extracting location for diagnostics
+    tasks = []
+    for i, coro in enumerate(coros):
+        coro_code = getattr(coro, "cr_code", None)
+        if coro_code:
+            filename = coro_code.co_filename
+            idx = filename.find("letta/")
+            filename = filename[idx + 6 :] if idx != -1 else filename.split("/")[-1]
+            coro_name = f"{filename}:{coro_code.co_firstlineno}:{coro_code.co_name}"
+        else:
+            coro_name = "unknown"
+        tasks.append(bounded_coro(i, coro, coro_name))
+    indexed_results = await asyncio.gather(*tasks)
+
+    # Sort by original index to preserve order
+    indexed_results.sort(key=lambda x: x[0])
+    return [result for _, result in indexed_results]
+
+
+async def decrypt_agent_secrets(agents: list) -> list:
+    """
+    Decrypt secrets for all agents outside DB session.
+
+    This allows DB connections to be released before expensive PBKDF2 operations,
+    preventing connection pool exhaustion during high load.
+
+    Uses bounded concurrency to limit thread pool pressure while allowing some
+    parallelism in the dedicated crypto executor.
+
+    Args:
+        agents: List of PydanticAgentState objects with encrypted secrets
+
+    Returns:
+        Same list with secrets decrypted
+    """
+
+    async def decrypt_env_var(env_var):
+        from letta.orm.agent import ENCRYPTED_PLACEHOLDER
+
+        if env_var.value_enc and (env_var.value is None or env_var.value == "" or env_var.value == ENCRYPTED_PLACEHOLDER):
+            env_var.value = await env_var.value_enc.get_plaintext_async()
+
+    # Collect all env vars that need decryption
+    decrypt_tasks = []
+    for agent in agents:
+        if agent.tool_exec_environment_variables:
+            for env_var in agent.tool_exec_environment_variables:
+                decrypt_tasks.append(decrypt_env_var(env_var))
+
+    # Decrypt with bounded concurrency (matches crypto executor size)
+    if decrypt_tasks:
+        await bounded_gather(decrypt_tasks, max_concurrency=8)
+
+    return agents

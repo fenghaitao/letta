@@ -11,18 +11,28 @@ from letta.schemas.providers import (
     GoogleAIProvider,
     GoogleVertexProvider,
     GroqProvider,
+    MiniMaxProvider,
     OllamaProvider,
     OpenAIProvider,
+    SGLangProvider,
     TogetherProvider,
     VLLMProvider,
+    ZAIProvider,
 )
+from letta.schemas.providers.chatgpt_oauth import CHATGPT_MODELS
+from letta.schemas.secret import Secret
 from letta.settings import model_settings
+
+
+def test_chatgpt_oauth_model_allowlist_includes_gpt_5_3_codex():
+    model_names = {model["name"] for model in CHATGPT_MODELS}
+    assert "gpt-5.3-codex" in model_names
 
 
 def test_openai():
     provider = OpenAIProvider(
         name="openai",
-        api_key=model_settings.openai_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.openai_api_key),
         base_url=model_settings.openai_api_base,
     )
     models = provider.list_llm_models()
@@ -38,7 +48,7 @@ def test_openai():
 async def test_openai_async():
     provider = OpenAIProvider(
         name="openai",
-        api_key=model_settings.openai_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.openai_api_key),
         base_url=model_settings.openai_api_base,
     )
     models = await provider.list_llm_models_async()
@@ -54,7 +64,7 @@ async def test_openai_async():
 async def test_anthropic():
     provider = AnthropicProvider(
         name="anthropic",
-        api_key=model_settings.anthropic_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.anthropic_api_key),
     )
     models = await provider.list_llm_models_async()
     assert len(models) > 0
@@ -67,7 +77,7 @@ async def test_googleai():
     assert api_key is not None
     provider = GoogleAIProvider(
         name="google_ai",
-        api_key=api_key,
+        api_key_enc=Secret.from_plaintext(api_key),
     )
     models = await provider.list_llm_models_async()
     assert len(models) > 0
@@ -97,7 +107,20 @@ async def test_google_vertex():
 @pytest.mark.skipif(model_settings.deepseek_api_key is None, reason="Only run if DEEPSEEK_API_KEY is set.")
 @pytest.mark.asyncio
 async def test_deepseek():
-    provider = DeepSeekProvider(name="deepseek", api_key=model_settings.deepseek_api_key)
+    provider = DeepSeekProvider(name="deepseek", api_key_enc=Secret.from_plaintext(model_settings.deepseek_api_key))
+    models = await provider.list_llm_models_async()
+    assert len(models) > 0
+    assert models[0].handle == f"{provider.name}/{models[0].model}"
+
+
+@pytest.mark.skipif(model_settings.zai_api_key is None, reason="Only run if ZAI_API_KEY is set.")
+@pytest.mark.asyncio
+async def test_zai():
+    provider = ZAIProvider(
+        name="zai",
+        api_key_enc=Secret.from_plaintext(model_settings.zai_api_key),
+        base_url=model_settings.zai_base_url,
+    )
     models = await provider.list_llm_models_async()
     assert len(models) > 0
     assert models[0].handle == f"{provider.name}/{models[0].model}"
@@ -108,11 +131,38 @@ async def test_deepseek():
 async def test_groq():
     provider = GroqProvider(
         name="groq",
-        api_key=model_settings.groq_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.groq_api_key),
     )
     models = await provider.list_llm_models_async()
     assert len(models) > 0
     assert models[0].handle == f"{provider.name}/{models[0].model}"
+
+
+@pytest.mark.asyncio
+async def test_minimax():
+    """Test MiniMax provider - uses hardcoded model list, no API key required."""
+    provider = MiniMaxProvider(name="minimax")
+    models = await provider.list_llm_models_async()
+
+    # Should have exactly 3 models: M2.1, M2.1-lightning, M2, M2.5, M2.7
+    assert len(models) == 5
+
+    # Verify model properties
+    model_names = {m.model for m in models}
+    assert "MiniMax-M2.1" in model_names
+    assert "MiniMax-M2.1-lightning" in model_names
+    assert "MiniMax-M2" in model_names
+    assert "MiniMax-M2.5" in model_names
+
+    # Verify handle format
+    for model in models:
+        assert model.handle == f"{provider.name}/{model.model}"
+        # All MiniMax models have 200K context window
+        assert model.context_window == 200000
+        # All MiniMax models have 128K max output
+        assert model.max_tokens == 128000
+        # MiniMax uses Anthropic-compatible API endpoint
+        assert model.model_endpoint_type == "minimax"
 
 
 @pytest.mark.skipif(model_settings.azure_api_key is None, reason="Only run if AZURE_API_KEY is set.")
@@ -120,7 +170,7 @@ async def test_groq():
 async def test_azure():
     provider = AzureProvider(
         name="azure",
-        api_key=model_settings.azure_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.azure_api_key),
         base_url=model_settings.azure_base_url,
         api_version=model_settings.azure_api_version,
     )
@@ -138,7 +188,7 @@ async def test_azure():
 async def test_together():
     provider = TogetherProvider(
         name="together",
-        api_key=model_settings.together_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.together_api_key),
         default_prompt_formatter=model_settings.default_prompt_formatter,
     )
     models = await provider.list_llm_models_async()
@@ -161,7 +211,6 @@ async def test_ollama():
     provider = OllamaProvider(
         name="ollama",
         base_url=model_settings.ollama_base_url,
-        api_key=None,
         default_prompt_formatter=model_settings.default_prompt_formatter,
     )
     models = await provider.list_llm_models_async()
@@ -185,6 +234,33 @@ async def test_vllm():
     assert len(embedding_models) == 0  # embedding models currently not supported by vLLM
 
 
+@pytest.mark.skipif(model_settings.lmstudio_base_url is None, reason="Only run if LMSTUDIO_BASE_URL is set.")
+@pytest.mark.asyncio
+async def test_lmstudio():
+    from letta.schemas.providers.lmstudio import LMStudioOpenAIProvider
+
+    provider = LMStudioOpenAIProvider(name="lmstudio_openai", base_url=model_settings.lmstudio_base_url)
+    models = await provider.list_llm_models_async()
+    assert len(models) > 0
+    assert models[0].handle == f"{provider.name}/{models[0].model}"
+
+    embedding_models = await provider.list_embedding_models_async()
+    assert len(embedding_models) > 0
+    assert embedding_models[0].handle == f"{provider.name}/{embedding_models[0].embedding_model}"
+
+
+@pytest.mark.skipif(model_settings.sglang_api_base is None, reason="Only run if SGLANG_API_BASE is set.")
+@pytest.mark.asyncio
+async def test_sglang():
+    provider = SGLangProvider(name="sglang", base_url=model_settings.sglang_api_base)
+    models = await provider.list_llm_models_async()
+    assert len(models) > 0
+    assert models[0].handle == f"{provider.name}/{models[0].model}"
+
+    embedding_models = await provider.list_embedding_models_async()
+    assert len(embedding_models) == 0  # embedding models currently not supported by SGLang
+
+
 # TODO: Add back in, difficulty adding this to CI properly, need boto credentials
 # def test_anthropic_bedrock():
 #     from letta.settings import model_settings
@@ -203,7 +279,7 @@ async def test_vllm():
 async def test_custom_anthropic():
     provider = AnthropicProvider(
         name="custom_anthropic",
-        api_key=model_settings.anthropic_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.anthropic_api_key),
     )
     models = await provider.list_llm_models_async()
     assert len(models) > 0
@@ -214,7 +290,7 @@ def test_provider_context_window():
     """Test that providers implement context window methods correctly."""
     provider = OpenAIProvider(
         name="openai",
-        api_key=model_settings.openai_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.openai_api_key),
         base_url=model_settings.openai_api_base,
     )
 
@@ -230,7 +306,7 @@ async def test_provider_context_window_async():
     """Test that providers implement async context window methods correctly."""
     provider = OpenAIProvider(
         name="openai",
-        api_key=model_settings.openai_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.openai_api_key),
         base_url=model_settings.openai_api_base,
     )
 
@@ -244,7 +320,7 @@ def test_provider_handle_generation():
     """Test that providers generate handles correctly."""
     provider = OpenAIProvider(
         name="test_openai",
-        api_key="test_key",
+        api_key_enc=Secret.from_plaintext("test_key"),
         base_url="https://api.openai.com/v1",
     )
 
@@ -266,14 +342,14 @@ def test_provider_casting():
         name="test_provider",
         provider_type=ProviderType.openai,
         provider_category=ProviderCategory.base,
-        api_key="test_key",
+        api_key_enc=Secret.from_plaintext("test_key"),
         base_url="https://api.openai.com/v1",
     )
 
     cast_provider = base_provider.cast_to_subtype()
     assert isinstance(cast_provider, OpenAIProvider)
     assert cast_provider.name == "test_provider"
-    assert cast_provider.api_key == "test_key"
+    assert cast_provider.api_key_enc.get_plaintext() == "test_key"
 
 
 @pytest.mark.asyncio
@@ -281,7 +357,7 @@ async def test_provider_embedding_models_consistency():
     """Test that providers return consistent embedding model formats."""
     provider = OpenAIProvider(
         name="openai",
-        api_key=model_settings.openai_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.openai_api_key),
         base_url=model_settings.openai_api_base,
     )
 
@@ -301,7 +377,7 @@ async def test_provider_llm_models_consistency():
     """Test that providers return consistent LLM model formats."""
     provider = OpenAIProvider(
         name="openai",
-        api_key=model_settings.openai_api_key,
+        api_key_enc=Secret.from_plaintext(model_settings.openai_api_key),
         base_url=model_settings.openai_api_base,
     )
 
@@ -335,6 +411,11 @@ async def test_provider_llm_models_consistency():
         ("anthropic/claude-3-7-sonnet", AgentType.memgpt_v2_agent, False, False, False, 0, None),
         ("anthropic/claude-sonnet-4", AgentType.memgpt_v2_agent, True, True, False, 1024, None),
         ("anthropic/claude-sonnet-4", AgentType.memgpt_v2_agent, False, False, False, 0, None),
+        # Opus 4.6 / Sonnet 4.6 use adaptive thinking - max_reasoning_tokens should stay 0
+        ("anthropic/claude-opus-4-6", AgentType.memgpt_v2_agent, True, True, False, 0, None),
+        ("anthropic/claude-opus-4-6", AgentType.memgpt_v2_agent, False, False, False, 0, None),
+        ("anthropic/claude-sonnet-4-6", AgentType.memgpt_v2_agent, True, True, False, 0, None),
+        ("anthropic/claude-sonnet-4-6", AgentType.memgpt_v2_agent, False, False, False, 0, None),
         ("google_vertex/gemini-2.0-flash", AgentType.memgpt_v2_agent, True, True, True, 0, None),
         ("google_vertex/gemini-2.0-flash", AgentType.memgpt_v2_agent, False, False, False, 0, None),
         ("google_vertex/gemini-2.5-flash", AgentType.memgpt_v2_agent, True, True, True, 1024, None),
@@ -352,6 +433,11 @@ async def test_provider_llm_models_consistency():
         ("anthropic/claude-3-7-sonnet", AgentType.letta_v1_agent, False, False, False, 0, None),
         ("anthropic/claude-sonnet-4", AgentType.letta_v1_agent, True, True, False, 1024, None),
         ("anthropic/claude-sonnet-4", AgentType.letta_v1_agent, False, False, False, 0, None),
+        # Opus 4.6 / Sonnet 4.6 use adaptive thinking - max_reasoning_tokens should stay 0
+        ("anthropic/claude-opus-4-6", AgentType.letta_v1_agent, True, True, False, 0, None),
+        ("anthropic/claude-opus-4-6", AgentType.letta_v1_agent, False, False, False, 0, None),
+        ("anthropic/claude-sonnet-4-6", AgentType.letta_v1_agent, True, True, False, 0, None),
+        ("anthropic/claude-sonnet-4-6", AgentType.letta_v1_agent, False, False, False, 0, None),
         ("google_vertex/gemini-2.0-flash", AgentType.letta_v1_agent, True, False, False, 0, None),
         ("google_vertex/gemini-2.0-flash", AgentType.letta_v1_agent, False, False, False, 0, None),
         ("google_vertex/gemini-2.5-flash", AgentType.letta_v1_agent, True, True, False, 1024, None),
@@ -367,7 +453,7 @@ def test_reasoning_toggle_by_provider(
     expected_enable_reasoner: bool,
     expected_put_inner_thoughts_in_kwargs: bool,
     expected_max_reasoning_tokens: int,
-    expected_reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]],
+    expected_reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]],
 ):
     model_endpoint_type, model = handle.split("/")
     config = LLMConfig(

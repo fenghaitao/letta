@@ -1,12 +1,15 @@
 import json
-import uuid
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
-from letta.errors import PendingApprovalError
+if TYPE_CHECKING:
+    from letta.schemas.tool import Tool
+
+from letta.errors import LettaError, PendingApprovalError
 from letta.helpers import ToolRulesSolver
 from letta.log import get_logger
+from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_message import MessageType
@@ -95,11 +98,40 @@ async def _prepare_in_context_messages_async(
     return current_in_context_messages, new_in_context_messages
 
 
-def validate_approval_tool_call_ids(approval_request_message: Message, approval_response_message: ApprovalCreate):
-    approval_requests = approval_request_message.tool_calls
-    approval_request_tool_call_ids = [approval_request.id for approval_request in approval_requests]
+@trace_method
+def validate_persisted_tool_call_ids(tool_return_message: Message, approval_response_message: ApprovalCreate) -> bool:
+    persisted_tool_returns = tool_return_message.tool_returns
+    if not persisted_tool_returns:
+        return False
+    persisted_tool_call_ids = [tool_return.tool_call_id for tool_return in persisted_tool_returns]
 
     approval_responses = approval_response_message.approvals
+    if not approval_responses:
+        return False
+    approval_response_tool_call_ids = [approval_response.tool_call_id for approval_response in approval_responses]
+
+    request_response_diff = set(persisted_tool_call_ids).symmetric_difference(set(approval_response_tool_call_ids))
+    if request_response_diff:
+        return False
+
+    return True
+
+
+@trace_method
+def validate_approval_tool_call_ids(approval_request_message: Message, approval_response_message: ApprovalCreate):
+    approval_requests = approval_request_message.tool_calls
+    if approval_requests:
+        approval_request_tool_call_ids = [approval_request.id for approval_request in approval_requests]
+    elif approval_request_message.tool_call_id:
+        approval_request_tool_call_ids = [approval_request_message.tool_call_id]
+    else:
+        raise ValueError(
+            f"Invalid tool call IDs. Approval request message '{approval_request_message.id}' does not contain any tool calls."
+        )
+
+    approval_responses = approval_response_message.approvals
+    if not approval_responses:
+        raise ValueError("Invalid approval response. Approval response message does not contain any approvals.")
     approval_response_tool_call_ids = [approval_response.tool_call_id for approval_response in approval_responses]
 
     request_response_diff = set(approval_request_tool_call_ids).symmetric_difference(set(approval_response_tool_call_ids))
@@ -113,15 +145,20 @@ def validate_approval_tool_call_ids(approval_request_message: Message, approval_
         )
 
 
+@trace_method
 async def _prepare_in_context_messages_no_persist_async(
     input_messages: List[MessageCreateBase],
     agent_state: AgentState,
     message_manager: MessageManager,
     actor: User,
     run_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> Tuple[List[Message], List[Message]]:
     """
     Prepares in-context messages for an agent, based on the current state and a new user input.
+
+    When conversation_id is provided, messages are loaded from the conversation_messages
+    table instead of agent_state.message_ids.
 
     Args:
         input_messages (List[MessageCreate]): The new user input messages to process.
@@ -129,6 +166,7 @@ async def _prepare_in_context_messages_no_persist_async(
         message_manager (MessageManager): The manager used to retrieve and create messages.
         actor (User): The user performing the action, used for access control and attribution.
         run_id (str): The run ID associated with this message processing.
+        conversation_id (str): Optional conversation ID to load messages from.
 
     Returns:
         Tuple[List[Message], List[Message]]: A tuple containing:
@@ -136,28 +174,139 @@ async def _prepare_in_context_messages_no_persist_async(
             - The new in-context messages (messages created from the new input).
     """
 
-    if agent_state.message_buffer_autoclear:
-        # If autoclear is enabled, only include the most recent system message (usually at index 0)
-        current_in_context_messages = [await message_manager.get_message_by_id_async(message_id=agent_state.message_ids[0], actor=actor)]
+    if conversation_id:
+        # Conversation mode: load messages from conversation_messages table
+        from letta.services.conversation_manager import ConversationManager
+
+        conversation_manager = ConversationManager()
+        message_ids = await conversation_manager.get_message_ids_for_conversation(
+            conversation_id=conversation_id,
+            actor=actor,
+        )
+
+        if agent_state.message_buffer_autoclear and message_ids:
+            # If autoclear is enabled, only include the system message
+            current_in_context_messages = [await message_manager.get_message_by_id_async(message_id=message_ids[0], actor=actor)]
+        elif message_ids:
+            # Otherwise, include the full list of messages from the conversation
+            current_in_context_messages = await message_manager.get_messages_by_ids_async(message_ids=message_ids, actor=actor)
+        else:
+            # No messages in conversation yet (fallback) - compile a new system message
+            # Normally this is handled at conversation creation time, but this covers
+            # edge cases where a conversation exists without a system message.
+            system_message = await conversation_manager.compile_and_save_system_message_for_conversation(
+                conversation_id=conversation_id,
+                agent_id=agent_state.id,
+                actor=actor,
+                agent_state=agent_state,
+                message_manager=message_manager,
+            )
+
+            current_in_context_messages = [system_message]
     else:
-        # Otherwise, include the full list of messages by ID for context
-        current_in_context_messages = await message_manager.get_messages_by_ids_async(message_ids=agent_state.message_ids, actor=actor)
+        # Default mode: load messages from agent_state.message_ids
+        if not agent_state.message_ids:
+            raise LettaError(
+                message=f"Agent {agent_state.id} has no in-context messages. "
+                "This typically means the agent's system message was not initialized correctly.",
+            )
+        if agent_state.message_buffer_autoclear:
+            # If autoclear is enabled, only include the most recent system message (usually at index 0)
+            current_in_context_messages = [
+                await message_manager.get_message_by_id_async(message_id=agent_state.message_ids[0], actor=actor)
+            ]
+        else:
+            # Otherwise, include the full list of messages by ID for context
+            current_in_context_messages = await message_manager.get_messages_by_ids_async(message_ids=agent_state.message_ids, actor=actor)
+
+    # Convert ToolReturnCreate to ApprovalCreate for unified processing
+    if input_messages[0].type == "tool_return":
+        tool_return_msg = input_messages[0]
+        input_messages = [
+            ApprovalCreate(approvals=tool_return_msg.tool_returns),
+            *input_messages[1:],
+        ]
 
     # Check for approval-related message validation
-    if len(input_messages) == 1 and input_messages[0].type == "approval":
+    if input_messages[0].type == "approval":
         # User is trying to send an approval response
         if current_in_context_messages and current_in_context_messages[-1].role != "approval":
+            # No pending approval request - check if this is an idempotent retry
+            # Check last few messages for a tool return matching the approval's tool_call_ids
+            # (approved tool return should be recent, but server-side tool calls may come after it)
+            approval_already_processed = False
+            recent_messages = current_in_context_messages[-10:]  # Only check last 10 messages
+            for msg in reversed(recent_messages):
+                if msg.role == "tool" and validate_persisted_tool_call_ids(msg, input_messages[0]):
+                    logger.info(
+                        f"Idempotency check: Found matching tool return in recent in-context history. "
+                        f"tool_returns={msg.tool_returns}, approval_response.approvals={input_messages[0].approvals}"
+                    )
+                    approval_already_processed = True
+                    break
+
+            # If not found in context and summarization just happened, check full history
+            non_system_summary_messages = [
+                m for m in current_in_context_messages if m.role not in (MessageRole.system, MessageRole.summary)
+            ]
+            if not approval_already_processed and len(non_system_summary_messages) == 0:
+                last_tool_messages = await message_manager.list_messages(
+                    actor=actor,
+                    agent_id=agent_state.id,
+                    roles=[MessageRole.tool],
+                    limit=1,
+                    ascending=False,  # Most recent first
+                )
+                if len(last_tool_messages) == 1 and validate_persisted_tool_call_ids(last_tool_messages[0], input_messages[0]):
+                    logger.info(
+                        f"Idempotency check: Found matching tool return in full history (post-compaction). "
+                        f"tool_returns={last_tool_messages[0].tool_returns}, approval_response.approvals={input_messages[0].approvals}"
+                    )
+                    approval_already_processed = True
+
+            if approval_already_processed:
+                # Approval already handled, just process follow-up messages if any or manually inject keep-alive message
+                follow_up = [m for m in input_messages[1:] if isinstance(m, MessageCreate)]
+                skipped = [m for m in input_messages[1:] if not isinstance(m, MessageCreate)]
+                if skipped:
+                    logger.warning(f"Filtered {len(skipped)} non-MessageCreate follow-up messages: {[type(m).__name__ for m in skipped]}")
+                keep_alive_messages = follow_up or [
+                    MessageCreate(
+                        role="user",
+                        content=[
+                            TextContent(
+                                text="<system-alert>Automated keep-alive ping. Ignore this message and continue from where you stopped.</system-alert>"
+                            )
+                        ],
+                    )
+                ]
+                new_in_context_messages = await create_input_messages(
+                    input_messages=keep_alive_messages, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=run_id, actor=actor
+                )
+                return current_in_context_messages, new_in_context_messages
+            logger.warn(
+                f"Cannot process approval response: No tool call is currently awaiting approval. Last message: {current_in_context_messages[-1]}"
+            )
             raise ValueError(
                 "Cannot process approval response: No tool call is currently awaiting approval. "
                 "Please send a regular message to interact with the agent."
             )
         validate_approval_tool_call_ids(current_in_context_messages[-1], input_messages[0])
-        new_in_context_messages = create_approval_response_message_from_input(
+        new_in_context_messages = await create_approval_response_message_from_input(
             agent_state=agent_state, input_message=input_messages[0], run_id=run_id
         )
+        follow_up = [m for m in input_messages[1:] if isinstance(m, MessageCreate)]
+        skipped = [m for m in input_messages[1:] if not isinstance(m, MessageCreate)]
+        if skipped:
+            logger.warning(f"Filtered {len(skipped)} non-MessageCreate follow-up messages: {[type(m).__name__ for m in skipped]}")
+        if follow_up:
+            follow_up_messages = await create_input_messages(
+                input_messages=follow_up, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=run_id, actor=actor
+            )
+            new_in_context_messages.extend(follow_up_messages)
     else:
         # User is trying to send a regular message
-        if current_in_context_messages and current_in_context_messages[-1].role == "approval":
+        if current_in_context_messages and current_in_context_messages[-1].is_approval_request():
             raise PendingApprovalError(pending_request_id=current_in_context_messages[-1].id)
 
         # Create a new user message from the input but dont store it yet

@@ -4,16 +4,20 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from letta.constants import CORE_MEMORY_LINE_NUMBER_WARNING, DEFAULT_EMBEDDING_CHUNK_SIZE
+from letta.constants import (
+    DEFAULT_EMBEDDING_CHUNK_SIZE,
+    MAX_FILES_OPEN_LIMIT,
+    MAX_PER_FILE_VIEW_WINDOW_CHAR_LIMIT,
+)
 from letta.errors import AgentExportProcessingError, LettaInvalidArgumentError
 from letta.schemas.block import Block, CreateBlock
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import PrimitiveType
 from letta.schemas.environment_variables import AgentEnvironmentVariable
-from letta.schemas.file import FileStatus
 from letta.schemas.group import Group
 from letta.schemas.identity import Identity
 from letta.schemas.letta_base import OrmMetadataBase
+from letta.schemas.letta_message import ApprovalRequestMessage
 from letta.schemas.letta_stop_reason import StopReasonType
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
@@ -24,7 +28,9 @@ from letta.schemas.response_format import ResponseFormatUnion
 from letta.schemas.source import Source
 from letta.schemas.tool import Tool
 from letta.schemas.tool_rule import ToolRule
+from letta.services.summarizer.summarizer_config import CompactionSettings
 from letta.utils import calculate_file_defaults_based_on_context_window, create_random_username
+from letta.validators import BlockId, IdentityId, MessageId, SourceId, ToolId
 
 
 # TODO: Remove this upon next OSS release, there's a duplicate AgentType in enums
@@ -50,6 +56,7 @@ AgentRelationships = Literal[
     "agent.blocks",
     "agent.identities",
     "agent.managed_group",
+    "agent.pending_approval",
     "agent.secrets",
     "agent.sources",
     "agent.tags",
@@ -80,12 +87,15 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     llm_config: LLMConfig = Field(
         ..., description="Deprecated: Use `model` field instead. The LLM configuration used by the agent.", deprecated=True
     )
-    embedding_config: EmbeddingConfig = Field(
-        ..., description="Deprecated: Use `embedding` field instead. The embedding configuration used by the agent.", deprecated=True
+    embedding_config: Optional[EmbeddingConfig] = Field(
+        None, description="Deprecated: Use `embedding` field instead. The embedding configuration used by the agent.", deprecated=True
     )
     model: Optional[str] = Field(None, description="The model handle used by the agent (format: provider/model-name).")
     embedding: Optional[str] = Field(None, description="The embedding model handle used by the agent (format: provider/model-name).")
     model_settings: Optional[ModelSettingsUnion] = Field(None, description="The model settings used by the agent.")
+    compaction_settings: Optional[CompactionSettings] = Field(
+        None, description="The compaction settings configuration used for compaction."
+    )
 
     response_format: Optional[ResponseFormatUnion] = Field(
         None,
@@ -121,6 +131,9 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
         [], description="Deprecated: Use `identities` field instead. The ids of the identities associated with this agent.", deprecated=True
     )
     identities: List[Identity] = Field([], description="The identities associated with this agent.")
+    pending_approval: Optional[ApprovalRequestMessage] = Field(
+        None, description="The latest approval request message pending for this agent, if any."
+    )
 
     # An advanced configuration that makes it so this agent does not remember any previous messages
     message_buffer_autoclear: bool = Field(
@@ -161,10 +174,11 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     )
 
     def get_agent_env_vars_as_dict(self) -> Dict[str, str]:
-        # Get environment variables for this agent specifically
+        # Get environment variables for this agent (value is already decrypted via from_orm_async)
         per_agent_env_vars = {}
         for agent_env_var_obj in self.secrets:
-            per_agent_env_vars[agent_env_var_obj.key] = agent_env_var_obj.value
+            # Use the pre-decrypted value field (populated by from_orm_async)
+            per_agent_env_vars[agent_env_var_obj.key] = agent_env_var_obj.value or ""
         return per_agent_env_vars
 
     @model_validator(mode="after")
@@ -200,12 +214,12 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     )
     # TODO: This is a legacy field and should be removed ASAP to force `tool_ids` usage
     tools: Optional[List[str]] = Field(None, description="The tools used by the agent.")
-    tool_ids: Optional[List[str]] = Field(None, description="The ids of the tools used by the agent.")
-    source_ids: Optional[List[str]] = Field(
+    tool_ids: Optional[List[ToolId]] = Field(None, description="The ids of the tools used by the agent.")
+    source_ids: Optional[List[SourceId]] = Field(
         None, description="Deprecated: Use `folder_ids` field instead. The ids of the sources used by the agent.", deprecated=True
     )
-    folder_ids: Optional[List[str]] = Field(None, description="The ids of the folders used by the agent.")
-    block_ids: Optional[List[str]] = Field(None, description="The ids of the blocks used by the agent.")
+    folder_ids: Optional[List[SourceId]] = Field(None, description="The ids of the folders used by the agent.")
+    block_ids: Optional[List[BlockId]] = Field(None, description="The ids of the blocks used by the agent.")
     tool_rules: Optional[List[ToolRule]] = Field(None, description="The tool rules governing the agent.")
     tags: Optional[List[str]] = Field(None, description="The tags associated with the agent.")
     system: Optional[str] = Field(None, description="The system prompt used by the agent.")
@@ -241,6 +255,9 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     )
     embedding: Optional[str] = Field(None, description="The embedding model handle used by the agent (format: provider/model-name).")
     model_settings: Optional[ModelSettingsUnion] = Field(None, description="The model settings for the agent.")
+    compaction_settings: Optional[CompactionSettings] = Field(
+        None, description="The compaction settings configuration used for compaction."
+    )
 
     context_window_limit: Optional[int] = Field(None, description="The context window limit used by the agent.")
     embedding_chunk_size: Optional[int] = Field(
@@ -293,13 +310,17 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
     base_template_id: Optional[str] = Field(
         None, description="Deprecated: No longer used. The base template id of the agent.", deprecated=True
     )
-    identity_ids: Optional[List[str]] = Field(None, description="The ids of the identities associated with this agent.")
+    identity_ids: Optional[List[IdentityId]] = Field(None, description="The ids of the identities associated with this agent.")
     message_buffer_autoclear: bool = Field(
         False,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
     )
     enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
-    response_format: Optional[ResponseFormatUnion] = Field(None, description="The response format for the agent.")
+    response_format: Optional[ResponseFormatUnion] = Field(
+        None,
+        description="Deprecated: Use `model_settings` field to configure response format instead. The response format for the agent.",
+        deprecated=True,
+    )
     timezone: Optional[str] = Field(None, description="The timezone of the agent (IANA format).")
     max_files_open: Optional[int] = Field(
         None,
@@ -377,6 +398,28 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
 
         return embedding
 
+    @field_validator("max_files_open")
+    @classmethod
+    def validate_max_files_open(cls, value: Optional[int]) -> Optional[int]:
+        """Validate max_files_open is within acceptable range."""
+        if value is not None and value > MAX_FILES_OPEN_LIMIT:
+            raise LettaInvalidArgumentError(
+                f"max_files_open cannot exceed {MAX_FILES_OPEN_LIMIT}. Got: {value}",
+                argument_name="max_files_open",
+            )
+        return value
+
+    @field_validator("per_file_view_window_char_limit")
+    @classmethod
+    def validate_per_file_view_window_char_limit(cls, value: Optional[int]) -> Optional[int]:
+        """Validate per_file_view_window_char_limit is within int32 range for database compatibility."""
+        if value is not None and value > MAX_PER_FILE_VIEW_WINDOW_CHAR_LIMIT:
+            raise LettaInvalidArgumentError(
+                f"per_file_view_window_char_limit cannot exceed {MAX_PER_FILE_VIEW_WINDOW_CHAR_LIMIT}. Got: {value}",
+                argument_name="per_file_view_window_char_limit",
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_sleeptime_for_agent_type(self) -> "CreateAgent":
         """Validate that enable_sleeptime is True when agent_type is a specific value"""
@@ -400,16 +443,16 @@ class InternalTemplateAgentCreate(CreateAgent):
 
 class UpdateAgent(BaseModel):
     name: Optional[str] = Field(None, description="The name of the agent.")
-    tool_ids: Optional[List[str]] = Field(None, description="The ids of the tools used by the agent.")
-    source_ids: Optional[List[str]] = Field(
+    tool_ids: Optional[List[ToolId]] = Field(None, description="The ids of the tools used by the agent.")
+    source_ids: Optional[List[SourceId]] = Field(
         None, description="Deprecated: Use `folder_ids` field instead. The ids of the sources used by the agent.", deprecated=True
     )
-    folder_ids: Optional[List[str]] = Field(None, description="The ids of the folders used by the agent.")
-    block_ids: Optional[List[str]] = Field(None, description="The ids of the blocks used by the agent.")
+    folder_ids: Optional[List[SourceId]] = Field(None, description="The ids of the folders used by the agent.")
+    block_ids: Optional[List[BlockId]] = Field(None, description="The ids of the blocks used by the agent.")
     tags: Optional[List[str]] = Field(None, description="The tags associated with the agent.")
     system: Optional[str] = Field(None, description="The system prompt used by the agent.")
     tool_rules: Optional[List[ToolRule]] = Field(None, description="The tool rules governing the agent.")
-    message_ids: Optional[List[str]] = Field(None, description="The ids of the messages in the agent's in-context memory.")
+    message_ids: Optional[List[MessageId]] = Field(None, description="The ids of the messages in the agent's in-context memory.")
     description: Optional[str] = Field(None, description="The description of the agent.")
     metadata: Optional[Dict] = Field(None, description="The metadata of the agent.")
     tool_exec_environment_variables: Optional[Dict[str, str]] = Field(None, description="Deprecated: use `secrets` field instead")
@@ -417,7 +460,7 @@ class UpdateAgent(BaseModel):
     project_id: Optional[str] = Field(None, description="The id of the project the agent belongs to.")
     template_id: Optional[str] = Field(None, description="The id of the template the agent belongs to.")
     base_template_id: Optional[str] = Field(None, description="The base template id of the agent.")
-    identity_ids: Optional[List[str]] = Field(None, description="The ids of the identities associated with this agent.")
+    identity_ids: Optional[List[IdentityId]] = Field(None, description="The ids of the identities associated with this agent.")
     message_buffer_autoclear: Optional[bool] = Field(
         None,
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
@@ -430,6 +473,10 @@ class UpdateAgent(BaseModel):
     )
     embedding: Optional[str] = Field(None, description="The embedding model handle used by the agent (format: provider/model-name).")
     model_settings: Optional[ModelSettingsUnion] = Field(None, description="The model settings for the agent.")
+    compaction_settings: Optional[CompactionSettings] = Field(
+        None, description="The compaction settings configuration used for compaction."
+    )
+
     context_window_limit: Optional[int] = Field(None, description="The context window limit used by the agent.")
     reasoning: Optional[bool] = Field(
         None,
@@ -447,7 +494,7 @@ class UpdateAgent(BaseModel):
     )
     response_format: Optional[ResponseFormatUnion] = Field(
         None,
-        description="Deprecated: Use `model` field to configure response format instead. The response format for the agent.",
+        description="Deprecated: Use `model_settings` field to configure response format instead. The response format for the agent.",
         deprecated=True,
     )
     max_tokens: Optional[int] = Field(
@@ -475,6 +522,28 @@ class UpdateAgent(BaseModel):
     )
 
     model_config = ConfigDict(extra="ignore")  # Ignores extra fields
+
+    @field_validator("max_files_open")
+    @classmethod
+    def validate_max_files_open(cls, value: Optional[int]) -> Optional[int]:
+        """Validate max_files_open is within acceptable range."""
+        if value is not None and value > MAX_FILES_OPEN_LIMIT:
+            raise LettaInvalidArgumentError(
+                f"max_files_open cannot exceed {MAX_FILES_OPEN_LIMIT}. Got: {value}",
+                argument_name="max_files_open",
+            )
+        return value
+
+    @field_validator("per_file_view_window_char_limit")
+    @classmethod
+    def validate_per_file_view_window_char_limit(cls, value: Optional[int]) -> Optional[int]:
+        """Validate per_file_view_window_char_limit is within int32 range for database compatibility."""
+        if value is not None and value > MAX_PER_FILE_VIEW_WINDOW_CHAR_LIMIT:
+            raise LettaInvalidArgumentError(
+                f"per_file_view_window_char_limit cannot exceed {MAX_PER_FILE_VIEW_WINDOW_CHAR_LIMIT}. Got: {value}",
+                argument_name="per_file_view_window_char_limit",
+            )
+        return value
 
 
 class AgentStepResponse(BaseModel):

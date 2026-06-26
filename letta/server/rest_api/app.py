@@ -5,36 +5,42 @@ import logging
 import os
 import platform
 import sys
-import threading
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Optional
 
+import anyio
 import uvicorn
 
 # Enable Python fault handler to get stack traces on segfaults
 faulthandler.enable()
 
+import orjson
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, ORJSONResponse
 from marshmallow import ValidationError
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from starlette.middleware.cors import CORSMiddleware
 
 from letta.__init__ import __version__ as letta_version
 from letta.agents.exceptions import IncompatibleAgentType
-from letta.constants import ADMIN_PREFIX, API_PREFIX, OPENAI_API_PREFIX
+from letta.constants import ADMIN_PREFIX, API_PREFIX
 from letta.errors import (
     AgentExportIdMappingError,
     AgentExportProcessingError,
     AgentFileImportError,
     AgentNotFoundForExportError,
     BedrockPermissionError,
+    ConcurrentUpdateError,
+    ContextWindowExceededError,
+    ConversationBusyError,
+    EmbeddingConfigRequiredError,
     HandleNotFoundError,
     LettaAgentNotFoundError,
     LettaExpiredError,
+    LettaImageFetchError,
     LettaInvalidArgumentError,
     LettaInvalidMCPSchemaError,
     LettaMCPConnectionError,
@@ -45,31 +51,68 @@ from letta.errors import (
     LettaUnsupportedFileUploadError,
     LettaUserNotFoundError,
     LLMAuthenticationError,
+    LLMBadRequestError,
     LLMError,
+    LLMInsufficientCreditsError,
     LLMProviderOverloaded,
     LLMRateLimitError,
     LLMTimeoutError,
+    MemoryRepoBusyError,
+    NoActiveRunsToCancelError,
     PendingApprovalError,
 )
+from letta.helpers.json_helpers import sanitize_unicode_surrogates
 from letta.helpers.pinecone_utils import get_pinecone_indices, should_use_pinecone, upsert_pinecone_indices
 from letta.jobs.scheduler import start_scheduler_with_leader_election
 from letta.log import get_logger
-from letta.orm.errors import DatabaseTimeoutError, ForeignKeyConstraintViolationError, NoResultFound, UniqueConstraintViolationError
+from letta.orm.errors import (
+    DatabaseDeadlockError,
+    DatabaseLockNotAvailableError,
+    DatabaseTimeoutError,
+    ForeignKeyConstraintViolationError,
+    NoResultFound,
+    UniqueConstraintViolationError,
+)
 from letta.otel.tracing import get_trace_id
-from letta.schemas.letta_message import create_letta_error_message_schema, create_letta_message_union_schema, create_letta_ping_schema
+from letta.schemas.letta_message import create_letta_error_message_schema, create_letta_message_union_schema
 from letta.schemas.letta_message_content import (
     create_letta_assistant_message_content_union_schema,
     create_letta_message_content_union_schema,
+    create_letta_tool_return_content_union_schema,
     create_letta_user_message_content_union_schema,
 )
 from letta.server.constants import REST_DEFAULT_PORT
-from letta.server.db import db_registry
+
+
+class SafeORJSONResponse(ORJSONResponse):
+    """ORJSONResponse that handles Python strings containing UTF-8 surrogates.
+
+    LLM responses or user input can occasionally contain surrogate characters
+    (U+D800–U+DFFF) which are valid in Python str but illegal in UTF-8.
+    Standard orjson serialisation rejects them with:
+        TypeError: str is not valid UTF-8: surrogates not allowed
+    This subclass catches that error, strips the surrogates, and retries.
+    """
+
+    def render(self, content) -> bytes:
+        try:
+            return super().render(content)
+        except TypeError as exc:
+            if "surrogates" not in str(exc):
+                raise
+            sanitized = sanitize_unicode_surrogates(content)
+            return orjson.dumps(
+                sanitized,
+                option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY,
+            )
+
+
 from letta.server.global_exception_handler import setup_global_exception_handlers
 
 # NOTE(charles): these are extra routes that are not part of v1 but we still need to mount to pass tests
 from letta.server.rest_api.auth.index import setup_auth_router  # TODO: probably remove right?
 from letta.server.rest_api.interface import StreamingServerInterface
-from letta.server.rest_api.middleware import CheckPasswordMiddleware, LoggingMiddleware
+from letta.server.rest_api.middleware import CheckPasswordMiddleware, LoggingMiddleware, RequestIdMiddleware
 from letta.server.rest_api.routers.v1 import ROUTERS as v1_routes
 from letta.server.rest_api.routers.v1.organizations import router as organizations_router
 from letta.server.rest_api.routers.v1.users import router as users_router  # TODO: decide on admin
@@ -101,8 +144,8 @@ def generate_openapi_schema(app: FastAPI):
     letta_docs["components"]["schemas"]["LettaMessageUnion"] = create_letta_message_union_schema()
     letta_docs["components"]["schemas"]["LettaMessageContentUnion"] = create_letta_message_content_union_schema()
     letta_docs["components"]["schemas"]["LettaAssistantMessageContentUnion"] = create_letta_assistant_message_content_union_schema()
+    letta_docs["components"]["schemas"]["LettaToolReturnContentUnion"] = create_letta_tool_return_content_union_schema()
     letta_docs["components"]["schemas"]["LettaUserMessageContentUnion"] = create_letta_user_message_content_union_schema()
-    letta_docs["components"]["schemas"]["LettaPing"] = create_letta_ping_schema()
     letta_docs["components"]["schemas"]["LettaErrorMessage"] = create_letta_error_message_schema()
 
     # Update the app's schema with our modified version
@@ -135,6 +178,9 @@ async def lifespan(app_: FastAPI):
     FastAPI lifespan context manager with setup before the app starts pre-yield and on shutdown after the yield.
     """
     worker_id = os.getpid()
+    from letta.monitoring.readiness_state import initialize_readiness_state, set_readiness_state
+
+    initialize_readiness_state(reason="warming", source="lifespan_startup")
 
     # Initialize event loop watchdog
     try:
@@ -160,10 +206,23 @@ async def lifespan(app_: FastAPI):
     except Exception as e:
         logger.warning(f"[Worker {worker_id}] Failed to download NLTK data: {e}")
 
-    # logger.info(f"[Worker {worker_id}] Starting lifespan initialization")
-    # logger.info(f"[Worker {worker_id}] Initializing database connections")
-    # db_registry.initialize_async()
-    # logger.info(f"[Worker {worker_id}] Database connections initialized")
+    # Log effective database timeout settings for debugging
+    try:
+        from sqlalchemy import text
+
+        from letta.otel.db_pool_monitoring import setup_pool_monitoring
+        from letta.server.db import db_registry, engine as db_engine
+
+        if settings.enable_db_pool_monitoring:
+            setup_pool_monitoring(db_engine.sync_engine, engine_name="core")
+            logger.info(f"[Worker {worker_id}] DB pool monitoring initialized")
+
+        async with db_registry.async_session() as session:
+            result = await session.execute(text("SHOW statement_timeout"))
+            statement_timeout = result.scalar()
+            logger.warning(f"[Worker {worker_id}] PostgreSQL statement_timeout: {statement_timeout}")
+    except Exception as e:
+        logger.warning(f"[Worker {worker_id}] Failed to query statement_timeout: {e}")
 
     if should_use_pinecone():
         if settings.upsert_pinecone_indices:
@@ -177,17 +236,39 @@ async def lifespan(app_: FastAPI):
 
     logger.info(f"[Worker {worker_id}] Starting scheduler with leader election")
     global server
-    await server.init_async()
+    await server.init_async(init_with_default_org_and_user=not settings.no_default_actor)
+
+    # Set server instance for git HTTP endpoints
+    try:
+        from letta.server.rest_api.routers.v1.git_http import set_server_instance
+
+        set_server_instance(server)
+        logger.info(f"[Worker {worker_id}] Git HTTP server instance set")
+    except Exception as e:
+        logger.warning(f"[Worker {worker_id}] Failed to set git HTTP server instance: {e}")
+
     try:
         await start_scheduler_with_leader_election(server)
         logger.info(f"[Worker {worker_id}] Scheduler initialization completed")
     except Exception as e:
         logger.error(f"[Worker {worker_id}] Scheduler initialization failed: {e}", exc_info=True)
+
+    set_readiness_state(reason="ready", source="lifespan_startup_complete")
     logger.info(f"[Worker {worker_id}] Lifespan startup completed")
     yield
 
     # Cleanup on shutdown
+    set_readiness_state(reason="draining", source="lifespan_shutdown")
     logger.info(f"[Worker {worker_id}] Starting lifespan shutdown")
+
+    # Stop watchdog thread (important for clean test/worker shutdown)
+    try:
+        from letta.monitoring.event_loop_watchdog import stop_watchdog
+
+        stop_watchdog()
+        logger.info(f"[Worker {worker_id}] Event loop watchdog stopped")
+    except Exception as e:
+        logger.warning(f"[Worker {worker_id}] Failed to stop watchdog: {e}")
 
     try:
         from letta.jobs.scheduler import shutdown_scheduler_and_release_lock
@@ -241,6 +322,62 @@ def create_application() -> "FastAPI":
             os.environ.setdefault("DD_PROFILING_MEMORY_ENABLED", str(telemetry_settings.datadog_profiling_memory_enabled).lower())
             os.environ.setdefault("DD_PROFILING_HEAP_ENABLED", str(telemetry_settings.datadog_profiling_heap_enabled).lower())
 
+            # Note: DD_LOGS_INJECTION, DD_APPSEC_ENABLED, DD_IAST_ENABLED, DD_APPSEC_SCA_ENABLED
+            # are set via deployment configs and automatically picked up by ddtrace
+
+            # Initialize Datadog tracer for APM (distributed tracing)
+            import ddtrace
+
+            ddtrace.patch_all()  # Auto-instrument FastAPI, HTTP, DB, etc.
+
+            llmobs_flag = os.getenv("DD_LLMOBS_ENABLED", "")
+            from ddtrace.llmobs import LLMObs
+
+            try:
+                from ddtrace.llmobs._constants import MODEL_PROVIDER
+                from ddtrace.llmobs._integrations.openai import OpenAIIntegration
+
+                if not getattr(OpenAIIntegration, "_letta_provider_patch_done", False):
+                    original_set_tags = OpenAIIntegration._llmobs_set_tags
+
+                    def _letta_set_tags(self, span, args, kwargs, response=None, operation=""):
+                        original_set_tags(self, span, args, kwargs, response=response, operation=operation)
+
+                        base_url = span.get_tag("openai.api_base")
+                        if not base_url:
+                            try:
+                                client = getattr(self, "_client", None)
+                                base_url = str(getattr(client, "_base_url", "") or "")
+                            except Exception:
+                                base_url = ""
+
+                        u = (base_url or "").lower()
+                        provider = None
+                        if "openrouter" in u:
+                            provider = "openrouter"
+                        elif "groq" in u:
+                            provider = "groq"
+
+                        if provider:
+                            span._set_ctx_item(MODEL_PROVIDER, provider)
+                            span._set_tag_str("openai.request.provider", provider)
+
+                    OpenAIIntegration._llmobs_set_tags = _letta_set_tags
+                    OpenAIIntegration._letta_provider_patch_done = True
+            except Exception:
+                logger.exception("Failed to patch ddtrace OpenAI LLMObs provider detection")
+
+            if llmobs_flag:
+                LLMObs.enable(
+                    ml_app=os.getenv("DD_LLMOBS_ML_APP") or telemetry_settings.datadog_service_name,
+                )
+
+            logger.info(
+                f"Datadog tracer initialized: env={dd_env}, "
+                f"service={telemetry_settings.datadog_service_name}, "
+                f"agent={telemetry_settings.datadog_agent_host}:{telemetry_settings.datadog_agent_port}"
+            )
+
             if telemetry_settings.datadog_profiling_enabled:
                 from ddtrace.profiling import Profiler
 
@@ -265,7 +402,7 @@ def create_application() -> "FastAPI":
                     f"agent={telemetry_settings.datadog_agent_host}:{telemetry_settings.datadog_agent_port}{git_info}"
                 )
         except Exception as e:
-            logger.error(f"Failed to initialize Datadog profiling: {e}", exc_info=True)
+            logger.error(f"Failed to initialize Datadog tracing/profiling: {e}", exc_info=True)
             if SENTRY_ENABLED:
                 sentry_sdk.capture_exception(e)
             # Don't fail application startup if Datadog initialization fails
@@ -279,6 +416,7 @@ def create_application() -> "FastAPI":
         version=letta_version,
         debug=debug_mode,  # if True, the stack trace will be printed in the response
         lifespan=lifespan,
+        default_response_class=SafeORJSONResponse,  # Use orjson for 10x faster JSON serialization, with surrogate safety
     )
 
     # === Global Exception Handlers ===
@@ -287,6 +425,12 @@ def create_application() -> "FastAPI":
 
     # === Exception Handlers ===
     # TODO (cliandy): move to separate file
+
+    @app.exception_handler(anyio.BrokenResourceError)
+    @app.exception_handler(anyio.ClosedResourceError)
+    async def client_disconnect_handler(request: Request, exc: Exception):
+        logger.info(f"Client disconnected: {request.method} {request.url.path}")
+        return JSONResponse(status_code=499, content={"detail": "Client disconnected"})
 
     @app.exception_handler(Exception)
     async def generic_error_handler(request: Request, exc: Exception):
@@ -414,6 +558,9 @@ def create_application() -> "FastAPI":
     app.add_exception_handler(LettaToolCreateError, _error_handler_400)
     app.add_exception_handler(LettaToolNameConflictError, _error_handler_400)
     app.add_exception_handler(AgentFileImportError, _error_handler_400)
+    app.add_exception_handler(EmbeddingConfigRequiredError, _error_handler_400)
+    app.add_exception_handler(LettaImageFetchError, _error_handler_400)
+    app.add_exception_handler(ContextWindowExceededError, _error_handler_400)
     app.add_exception_handler(ValueError, _error_handler_400)
 
     # 404 Not Found errors
@@ -434,7 +581,19 @@ def create_application() -> "FastAPI":
     app.add_exception_handler(ForeignKeyConstraintViolationError, _error_handler_409)
     app.add_exception_handler(UniqueConstraintViolationError, _error_handler_409)
     app.add_exception_handler(IntegrityError, _error_handler_409)
+    app.add_exception_handler(ConcurrentUpdateError, _error_handler_409)
+
+    async def _conversation_busy_handler(request: Request, exc: ConversationBusyError):
+        logger.error(f"{type(exc).__name__}", exc_info=exc)
+        content = {"detail": str(exc)}
+        if exc.run_id:
+            content["run_id"] = exc.run_id
+        return JSONResponse(status_code=409, content=content)
+
+    app.add_exception_handler(ConversationBusyError, _conversation_busy_handler)
+    app.add_exception_handler(MemoryRepoBusyError, _error_handler_409)
     app.add_exception_handler(PendingApprovalError, _error_handler_409)
+    app.add_exception_handler(NoActiveRunsToCancelError, _error_handler_409)
 
     # 415 Unsupported Media Type errors
     app.add_exception_handler(LettaUnsupportedFileUploadError, _error_handler_415)
@@ -450,6 +609,44 @@ def create_application() -> "FastAPI":
     app.add_exception_handler(OperationalError, _error_handler_503)
     app.add_exception_handler(LettaServiceUnavailableError, _error_handler_503)
     app.add_exception_handler(LLMProviderOverloaded, _error_handler_503)
+
+    @app.exception_handler(DatabaseLockNotAvailableError)
+    async def database_lock_not_available_handler(request: Request, exc: DatabaseLockNotAvailableError):
+        logger.warning(f"Lock not available: {exc}. Original exception: {exc.original_exception}")
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "The resource is currently locked by another operation. Please retry shortly."},
+            headers={"Retry-After": "1"},
+        )
+
+    @app.exception_handler(DatabaseDeadlockError)
+    async def database_deadlock_error_handler(request: Request, exc: DatabaseDeadlockError):
+        logger.error(f"Deadlock detected: {exc}. Original exception: {exc.original_exception}")
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "A database deadlock was detected. Please retry your request."},
+            headers={"Retry-After": "1"},
+        )
+
+    @app.exception_handler(DBAPIError)
+    async def dbapi_error_handler(request: Request, exc: DBAPIError):
+        from asyncpg.exceptions import DeadlockDetectedError
+
+        if isinstance(exc.orig, DeadlockDetectedError):
+            logger.error(f"Deadlock detected (DBAPIError wrapper): {exc}")
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "A database deadlock was detected. Please retry your request."},
+                headers={"Retry-After": "1"},
+            )
+
+        logger.error(f"Unhandled DBAPIError: {exc}", exc_info=True)
+        if SENTRY_ENABLED:
+            sentry_sdk.capture_exception(exc)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "A database error occurred."},
+        )
 
     @app.exception_handler(IncompatibleAgentType)
     async def handle_incompatible_agent_type(request: Request, exc: IncompatibleAgentType):
@@ -507,12 +704,37 @@ def create_application() -> "FastAPI":
 
     @app.exception_handler(LLMRateLimitError)
     async def llm_rate_limit_error_handler(request: Request, exc: LLMRateLimitError):
+        is_byok = exc.details.get("is_byok") if isinstance(exc.details, dict) else None
+        if is_byok:
+            message = (
+                "Rate limit exceeded on your API key. Please check your provider's rate limits and billing, or reduce request frequency."
+            )
+        else:
+            message = "Rate limit exceeded for LLM model provider. Please wait before making another request."
         return JSONResponse(
             status_code=429,
             content={
                 "error": {
                     "type": "llm_rate_limit",
-                    "message": "Rate limit exceeded for LLM model provider. Please wait before making another request.",
+                    "message": message,
+                    "detail": str(exc),
+                }
+            },
+        )
+
+    @app.exception_handler(LLMInsufficientCreditsError)
+    async def llm_insufficient_credits_handler(request: Request, exc: LLMInsufficientCreditsError):
+        is_byok = exc.details.get("is_byok") if isinstance(exc.details, dict) else None
+        if is_byok:
+            message = "Insufficient credits on your API key. Please add credits with your LLM provider."
+        else:
+            message = "Insufficient credits for LLM request. Please check your account."
+        return JSONResponse(
+            status_code=402,
+            content={
+                "error": {
+                    "type": "llm_insufficient_credits",
+                    "message": message,
                     "detail": str(exc),
                 }
             },
@@ -544,10 +766,23 @@ def create_application() -> "FastAPI":
             },
         )
 
+    @app.exception_handler(LLMBadRequestError)
+    async def llm_bad_request_error_handler(request: Request, exc: LLMBadRequestError):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "type": "llm_bad_request",
+                    "message": "The request to the LLM model provider was invalid.",
+                    "detail": str(exc),
+                }
+            },
+        )
+
     @app.exception_handler(LLMError)
     async def llm_error_handler(request: Request, exc: LLMError):
         return JSONResponse(
-            status_code=502,
+            status_code=500,
             content={
                 "error": {
                     "type": "llm_error",
@@ -568,6 +803,10 @@ def create_application() -> "FastAPI":
 
     # Add unified logging middleware - enriches log context and logs exceptions
     app.add_middleware(LoggingMiddleware)
+
+    # Add request ID middleware - extracts x-api-request-log-id header and sets it in contextvar
+    # This is a pure ASGI middleware to properly propagate contextvars to streaming responses
+    app.add_middleware(RequestIdMiddleware)
 
     app.add_middleware(
         CORSMiddleware,
@@ -616,9 +855,6 @@ def create_application() -> "FastAPI":
         # we should always tie this to the newest version of the api.
         # app.include_router(route, prefix="", include_in_schema=False)
         app.include_router(route, prefix="/latest", include_in_schema=False)
-
-    # NOTE: ethan these are the extra routes
-    # TODO(ethan) remove
 
     # admin/users
     app.include_router(users_router, prefix=ADMIN_PREFIX)
@@ -671,7 +907,7 @@ def start_server(
             import uvloop
 
             asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except:
+    except Exception:
         pass
 
     if (os.getenv("LOCAL_HTTPS") == "true") or "--localhttps" in sys.argv:
@@ -708,6 +944,7 @@ def start_server(
                 timeout_keep_alive=settings.uvicorn_timeout_keep_alive,
                 ssl_keyfile="certs/localhost-key.pem",
                 ssl_certfile="certs/localhost.pem",
+                access_log=False,
             )
 
     else:
@@ -746,4 +983,5 @@ def start_server(
                 workers=settings.uvicorn_workers,
                 reload=reload or settings.uvicorn_reload,
                 timeout_keep_alive=settings.uvicorn_timeout_keep_alive,
+                access_log=False,
             )

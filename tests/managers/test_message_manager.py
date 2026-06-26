@@ -1,105 +1,18 @@
-import json
-import logging
-import os
-import random
-import re
-import string
-import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import List
-from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from _pytest.python_api import approx
-from anthropic.types.beta import BetaMessage
-from anthropic.types.beta.messages import BetaMessageBatchIndividualResponse, BetaMessageBatchSucceededResult
 
 # Import shared fixtures and constants from conftest
-from conftest import (
-    CREATE_DELAY_SQLITE,
-    DEFAULT_EMBEDDING_CONFIG,
-    USING_SQLITE,
-)
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall as OpenAIToolCall, Function as OpenAIFunction
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError, InvalidRequestError
-from sqlalchemy.orm.exc import StaleDataError
 
-from letta.config import LettaConfig
-from letta.constants import (
-    BASE_MEMORY_TOOLS,
-    BASE_SLEEPTIME_TOOLS,
-    BASE_TOOLS,
-    BASE_VOICE_SLEEPTIME_CHAT_TOOLS,
-    BASE_VOICE_SLEEPTIME_TOOLS,
-    BUILTIN_TOOLS,
-    DEFAULT_ORG_ID,
-    DEFAULT_ORG_NAME,
-    FILES_TOOLS,
-    LETTA_TOOL_EXECUTION_DIR,
-    LETTA_TOOL_SET,
-    LOCAL_ONLY_MULTI_AGENT_TOOLS,
-    MCP_TOOL_TAG_NAME_PREFIX,
-    MULTI_AGENT_TOOLS,
-)
-from letta.data_sources.redis_client import NoopAsyncRedisClient, get_redis_client
-from letta.errors import LettaAgentNotFoundError
-from letta.functions.functions import derive_openai_json_schema, parse_source_code
-from letta.functions.mcp_client.types import MCPTool
-from letta.helpers import ToolRulesSolver
-from letta.helpers.datetime_helpers import AsyncTimer
-from letta.jobs.types import ItemUpdateInfo, RequestStatusUpdateInfo, StepStatusUpdateInfo
-from letta.orm import Base, Block
-from letta.orm.block_history import BlockHistory
-from letta.orm.errors import NoResultFound, UniqueConstraintViolationError
-from letta.orm.file import FileContent as FileContentModel, FileMetadata as FileMetadataModel
-from letta.schemas.agent import CreateAgent, UpdateAgent
-from letta.schemas.block import Block as PydanticBlock, BlockUpdate, CreateBlock
-from letta.schemas.embedding_config import EmbeddingConfig
+from letta.orm.errors import UniqueConstraintViolationError
 from letta.schemas.enums import (
-    ActorType,
-    AgentStepStatus,
-    FileProcessingStatus,
-    JobStatus,
-    JobType,
     MessageRole,
-    ProviderType,
-    SandboxType,
-    StepStatus,
-    TagMatchMode,
-    ToolType,
-    VectorDBProvider,
 )
-from letta.schemas.environment_variables import SandboxEnvironmentVariableCreate, SandboxEnvironmentVariableUpdate
-from letta.schemas.file import FileMetadata, FileMetadata as PydanticFileMetadata
-from letta.schemas.identity import IdentityCreate, IdentityProperty, IdentityPropertyType, IdentityType, IdentityUpdate, IdentityUpsert
-from letta.schemas.job import BatchJob, Job, Job as PydanticJob, JobUpdate, LettaRequestConfig
 from letta.schemas.letta_message import UpdateAssistantMessage, UpdateReasoningMessage, UpdateSystemMessage, UpdateUserMessage
 from letta.schemas.letta_message_content import TextContent
-from letta.schemas.letta_stop_reason import LettaStopReason, StopReasonType
-from letta.schemas.llm_batch_job import AgentStepState, LLMBatchItem
-from letta.schemas.llm_config import LLMConfig
-from letta.schemas.message import Message as PydanticMessage, MessageCreate, MessageUpdate
-from letta.schemas.openai.chat_completion_response import UsageStatistics
-from letta.schemas.organization import Organization, Organization as PydanticOrganization, OrganizationUpdate
-from letta.schemas.passage import Passage as PydanticPassage
-from letta.schemas.pip_requirement import PipRequirement
-from letta.schemas.run import Run as PydanticRun
-from letta.schemas.sandbox_config import E2BSandboxConfig, LocalSandboxConfig, SandboxConfigCreate, SandboxConfigUpdate
-from letta.schemas.source import Source as PydanticSource, SourceUpdate
-from letta.schemas.tool import Tool as PydanticTool, ToolCreate, ToolUpdate
-from letta.schemas.tool_rule import InitToolRule
-from letta.schemas.user import User as PydanticUser, UserUpdate
-from letta.server.db import db_registry
+from letta.schemas.message import Message as PydanticMessage, MessageUpdate
 from letta.server.server import SyncServer
-from letta.services.block_manager import BlockManager
-from letta.services.helpers.agent_manager_helper import calculate_base_tools, calculate_multi_agent_tools, validate_agent_exists_async
-from letta.services.step_manager import FeedbackType
-from letta.settings import settings, tool_settings
-from letta.utils import calculate_file_defaults_based_on_context_window
-from tests.helpers.utils import comprehensive_agent_checks, validate_context_window_overview
-from tests.utils import random_string
 
 # ======================================================================================================================
 # AgentManager Tests - Messages Relationship
@@ -109,8 +22,8 @@ from tests.utils import random_string
 @pytest.mark.asyncio
 async def test_reset_messages_no_messages(server: SyncServer, sarah_agent, default_user):
     """
-    Test that resetting messages on an agent that has zero messages
-    does not fail and clears out message_ids if somehow it's non-empty.
+    Test that resetting messages on an agent clears message_ids to only system message,
+    but messages remain in the database.
     """
     assert len(sarah_agent.message_ids) == 4
     og_message_ids = sarah_agent.message_ids
@@ -119,15 +32,15 @@ async def test_reset_messages_no_messages(server: SyncServer, sarah_agent, defau
     reset_agent = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
     assert len(reset_agent.message_ids) == 1
     assert og_message_ids[0] == reset_agent.message_ids[0]
-    # Double check that physically no messages exist
-    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 1
+    # Messages should still exist in the database (only cleared from context, not deleted)
+    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 4
 
 
 @pytest.mark.asyncio
 async def test_reset_messages_default_messages(server: SyncServer, sarah_agent, default_user):
     """
-    Test that resetting messages on an agent that has zero messages
-    does not fail and clears out message_ids if somehow it's non-empty.
+    Test that resetting messages with add_default_initial_messages=True
+    clears context and adds new default messages, while old messages remain in database.
     """
     assert len(sarah_agent.message_ids) == 4
     og_message_ids = sarah_agent.message_ids
@@ -141,15 +54,16 @@ async def test_reset_messages_default_messages(server: SyncServer, sarah_agent, 
     assert og_message_ids[1] != reset_agent.message_ids[1]
     assert og_message_ids[2] != reset_agent.message_ids[2]
     assert og_message_ids[3] != reset_agent.message_ids[3]
-    # Double check that physically no messages exist
-    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 4
+    # Old messages (4) + new default messages (3) = 7 total in database
+    # (system message is preserved, so 4 old + 3 new non-system = 7)
+    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 7
 
 
 @pytest.mark.asyncio
 async def test_reset_messages_with_existing_messages(server: SyncServer, sarah_agent, default_user):
     """
     Test that resetting messages on an agent with actual messages
-    deletes them from the database and clears message_ids.
+    clears message_ids but keeps messages in the database.
     """
     # 1. Create multiple messages for the agent
     msg1 = await server.message_manager.create_many_messages_async(
@@ -185,11 +99,11 @@ async def test_reset_messages_with_existing_messages(server: SyncServer, sarah_a
     # 2. Reset all messages
     reset_agent = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
 
-    # 3. Verify the agent now has zero message_ids
+    # 3. Verify the agent now has only system message in context
     assert len(reset_agent.message_ids) == 1
 
-    # 4. Verify the messages are physically removed
-    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 1
+    # 4. Verify the messages still exist in the database (only cleared from context)
+    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 6
 
 
 @pytest.mark.asyncio
@@ -197,7 +111,7 @@ async def test_reset_messages_idempotency(server: SyncServer, sarah_agent, defau
     """
     Test that calling reset_messages multiple times has no adverse effect.
     """
-    # Clear messages first
+    # Clear messages first (actually delete from DB for this test setup)
     await server.message_manager.delete_messages_by_ids_async(message_ids=sarah_agent.message_ids[1:], actor=default_user)
 
     # Create a single message
@@ -211,15 +125,16 @@ async def test_reset_messages_idempotency(server: SyncServer, sarah_agent, defau
         ],
         actor=default_user,
     )
-    # First reset
+    # First reset - clears context but messages remain in DB
     reset_agent = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
     assert len(reset_agent.message_ids) == 1
-    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 1
+    # DB has system message + the user message we created = 2
+    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 2
 
     # Second reset should do nothing new
     reset_agent_again = await server.agent_manager.reset_messages_async(agent_id=sarah_agent.id, actor=default_user)
-    assert len(reset_agent.message_ids) == 1
-    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 1
+    assert len(reset_agent_again.message_ids) == 1
+    assert await server.message_manager.size_async(agent_id=sarah_agent.id, actor=default_user) == 2
 
 
 @pytest.mark.asyncio
@@ -299,10 +214,10 @@ async def test_modify_letta_message(server: SyncServer, sarah_agent, default_use
     messages = await server.message_manager.list_messages(agent_id=sarah_agent.id, actor=default_user)
     letta_messages = PydanticMessage.to_letta_messages_from_list(messages=messages)
 
-    system_message = [msg for msg in letta_messages if msg.message_type == "system_message"][0]
-    assistant_message = [msg for msg in letta_messages if msg.message_type == "assistant_message"][0]
-    user_message = [msg for msg in letta_messages if msg.message_type == "user_message"][0]
-    reasoning_message = [msg for msg in letta_messages if msg.message_type == "reasoning_message"][0]
+    system_message = next(msg for msg in letta_messages if msg.message_type == "system_message")
+    assistant_message = next(msg for msg in letta_messages if msg.message_type == "assistant_message")
+    user_message = next(msg for msg in letta_messages if msg.message_type == "user_message")
+    reasoning_message = next(msg for msg in letta_messages if msg.message_type == "reasoning_message")
 
     # user message
     update_user_message = UpdateUserMessage(content="Hello, Sarah!")
@@ -408,6 +323,110 @@ async def test_message_delete(server: SyncServer, hello_world_message_fixture, d
     await server.message_manager.delete_message_by_id_async(hello_world_message_fixture.id, actor=default_user)
     retrieved = await server.message_manager.get_message_by_id_async(hello_world_message_fixture.id, actor=default_user)
     assert retrieved is None
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_message_excluded_from_list_and_getters(server: SyncServer, sarah_agent, default_user):
+    """Test soft-deleted messages are excluded from list/get message APIs."""
+    message = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role=MessageRole.user,
+        content=[TextContent(text="soft delete visibility test")],
+    )
+
+    created = await server.message_manager.create_many_messages_async([message], actor=default_user)
+    assert len(created) == 1
+    message_id = created[0].id
+
+    # Verify message is initially visible
+    assert await server.message_manager.get_message_by_id_async(message_id, actor=default_user) is not None
+    fetched_by_ids = await server.message_manager.get_messages_by_ids_async([message_id], actor=default_user)
+    assert [m.id for m in fetched_by_ids] == [message_id]
+
+    listed_before = await server.message_manager.list_messages(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        roles=[MessageRole.user],
+        limit=200,
+        ascending=False,
+    )
+    assert message_id in [m.id for m in listed_before]
+
+    # Soft delete message directly in ORM
+    from letta.orm.message import Message as MessageModel
+    from letta.server.db import db_registry
+
+    async with db_registry.async_session() as session:
+        orm_message = await MessageModel.read_async(db_session=session, identifier=message_id, actor=default_user)
+        orm_message.is_deleted = True
+        await orm_message.update_async(db_session=session, actor=default_user)
+
+    # Verify hidden everywhere
+    assert await server.message_manager.get_message_by_id_async(message_id, actor=default_user) is None
+    fetched_by_ids_after = await server.message_manager.get_messages_by_ids_async([message_id], actor=default_user)
+    assert fetched_by_ids_after == []
+
+    listed_after = await server.message_manager.list_messages(
+        actor=default_user,
+        agent_id=sarah_agent.id,
+        roles=[MessageRole.user],
+        limit=200,
+        ascending=False,
+    )
+    assert message_id not in [m.id for m in listed_after]
+
+
+@pytest.mark.asyncio
+async def test_message_conversation_id_persistence(server: SyncServer, sarah_agent, default_user):
+    """Test that conversation_id is properly persisted and retrieved from DB to Pydantic object"""
+    from letta.schemas.conversation import CreateConversation
+    from letta.services.conversation_manager import ConversationManager
+
+    conversation_manager = ConversationManager()
+
+    # Test 1: Create a message without conversation_id (should be None - the default/backward-compat case)
+    message_no_conv = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role=MessageRole.user,
+        content=[TextContent(text="Test message without conversation")],
+    )
+
+    created_no_conv = await server.message_manager.create_many_messages_async([message_no_conv], actor=default_user)
+    assert len(created_no_conv) == 1
+    assert created_no_conv[0].conversation_id is None
+
+    # Verify retrieval also has None - this confirms ORM-to-Pydantic conversion works for None
+    retrieved_no_conv = await server.message_manager.get_message_by_id_async(created_no_conv[0].id, actor=default_user)
+    assert retrieved_no_conv is not None
+    assert retrieved_no_conv.conversation_id is None
+    assert retrieved_no_conv.id == created_no_conv[0].id
+
+    # Test 2: Create a conversation and a message with that conversation_id
+    conversation = await conversation_manager.create_conversation(
+        agent_id=sarah_agent.id,
+        conversation_create=CreateConversation(summary="Test conversation"),
+        actor=default_user,
+    )
+
+    message_with_conv = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role=MessageRole.user,
+        content=[TextContent(text="Test message with conversation")],
+        conversation_id=conversation.id,
+    )
+
+    created_with_conv = await server.message_manager.create_many_messages_async([message_with_conv], actor=default_user)
+    assert len(created_with_conv) == 1
+    assert created_with_conv[0].conversation_id == conversation.id
+
+    # Verify retrieval has the correct conversation_id - this confirms ORM-to-Pydantic conversion works for non-None
+    retrieved_with_conv = await server.message_manager.get_message_by_id_async(created_with_conv[0].id, actor=default_user)
+    assert retrieved_with_conv is not None
+    assert retrieved_with_conv.conversation_id == conversation.id
+    assert retrieved_with_conv.id == created_with_conv[0].id
+
+    # Test 3: Verify the field exists on the Pydantic model
+    assert hasattr(retrieved_with_conv, "conversation_id")
 
 
 @pytest.mark.asyncio
@@ -794,7 +813,6 @@ async def test_create_many_messages_async_with_turbopuffer(server: SyncServer, s
 @pytest.mark.asyncio
 async def test_convert_tool_call_messages_no_assistant_mode(server: SyncServer, sarah_agent, default_user):
     """Test that when assistant mode is off, all tool calls go into a single ToolCallMessage"""
-    from letta.schemas.letta_message import ToolCall
 
     # create a message with multiple tool calls
     tool_calls = [
@@ -1017,3 +1035,70 @@ async def test_convert_tool_calls_only_assistant_tools(server: SyncServer, sarah
     # check assistant messages content (they appear in reverse order)
     assert letta_messages[0].content == "Second message"
     assert letta_messages[1].content == "First message"
+
+
+@pytest.mark.asyncio
+async def test_convert_assistant_message_with_dict_content(server: SyncServer, sarah_agent, default_user):
+    """Test that send_message with dict content is properly serialized to JSON string
+
+    Regression test for bug where dict content like {'tofu': 1, 'mofu': 1, 'bofu': 1}
+    caused pydantic validation error because AssistantMessage.content expects a string.
+    """
+    import json
+
+    # Test case 1: Simple dict as message content
+    tool_calls = [
+        OpenAIToolCall(
+            id="call_1",
+            type="function",
+            function=OpenAIFunction(name="send_message", arguments='{"message": {"tofu": 1, "mofu": 1, "bofu": 1}}'),
+        ),
+    ]
+
+    message = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role=MessageRole.assistant,
+        content=[TextContent(text="Sending structured data...")],
+        tool_calls=tool_calls,
+    )
+
+    # convert with assistant mode - should not raise validation error
+    letta_messages = message.to_letta_messages(use_assistant_message=True)
+
+    assert len(letta_messages) == 2
+    assert letta_messages[0].message_type == "assistant_message"
+    assert letta_messages[1].message_type == "reasoning_message"
+
+    # check that dict was serialized to JSON string
+    assistant_msg = letta_messages[0]
+    assert isinstance(assistant_msg.content, str)
+
+    # verify the JSON-serialized content can be parsed back
+    parsed_content = json.loads(assistant_msg.content)
+    assert parsed_content == {"tofu": 1, "mofu": 1, "bofu": 1}
+
+    # Test case 2: Nested dict with various types
+    tool_calls_nested = [
+        OpenAIToolCall(
+            id="call_2",
+            type="function",
+            function=OpenAIFunction(
+                name="send_message",
+                arguments='{"message": {"status": "success", "data": {"count": 42, "items": ["a", "b"]}, "meta": null}}',
+            ),
+        ),
+    ]
+
+    message_nested = PydanticMessage(
+        agent_id=sarah_agent.id,
+        role=MessageRole.assistant,
+        content=[TextContent(text="Sending complex data...")],
+        tool_calls=tool_calls_nested,
+    )
+
+    letta_messages_nested = message_nested.to_letta_messages(use_assistant_message=True)
+    assistant_msg_nested = letta_messages_nested[0]
+
+    assert isinstance(assistant_msg_nested.content, str)
+    parsed_nested = json.loads(assistant_msg_nested.content)
+    assert parsed_nested == {"status": "success", "data": {"count": 42, "items": ["a", "b"]}, "meta": None}

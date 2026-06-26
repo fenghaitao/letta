@@ -63,36 +63,31 @@ def test_multi_agent_large(server, default_user, roll_dice_tool, num_workers):
             tool_ids=[send_message_tool_id],
             include_base_tools=True,
             model="openai/gpt-4o-mini",
-            embedding="letta/letta-free",
+            embedding="openai/text-embedding-3-small",
             tags=manager_tags,
         ),
         actor=default_user,
     )
 
-    manager_agent = server.load_agent(agent_id=manager_agent_state.id, actor=default_user)
-
     # Create N worker agents
-    worker_agents = []
     for idx in tqdm(range(num_workers)):
-        worker_agent_state = server.create_agent(
+        server.create_agent(
             CreateAgent(
                 name=f"worker-{idx}",
                 tool_ids=[roll_dice_tool.id],
                 include_multi_agent_tools=False,
                 include_base_tools=True,
                 model="openai/gpt-4o-mini",
-                embedding="letta/letta-free",
+                embedding="openai/text-embedding-3-small",
                 tags=worker_tags,
             ),
             actor=default_user,
         )
-        worker_agent = server.load_agent(agent_id=worker_agent_state.id, actor=default_user)
-        worker_agents.append(worker_agent)
 
     # Manager sends broadcast message
     broadcast_message = f"Send a message to all agents with tags {worker_tags} asking them to roll a dice for you!"
     server.send_messages(
         actor=default_user,
-        agent_id=manager_agent.agent_state.id,
+        agent_id=manager_agent_state.id,
         input_messages=[MessageCreate(role="user", content=broadcast_message)],
     )

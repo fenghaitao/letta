@@ -1,35 +1,43 @@
 import asyncio
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
-from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, String
-from sqlalchemy.ext.asyncio import AsyncAttrs
+from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, String, select
+from sqlalchemy.ext.asyncio import AsyncAttrs, async_object_session
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from letta.orm.block import Block
-from letta.orm.custom_columns import EmbeddingConfigColumn, LLMConfigColumn, ResponseFormatColumn, ToolRulesColumn
+from letta.orm.custom_columns import CompactionSettingsColumn, EmbeddingConfigColumn, LLMConfigColumn, ResponseFormatColumn, ToolRulesColumn
 from letta.orm.identity import Identity
+from letta.orm.message import Message as MessageModel
 from letta.orm.mixins import OrganizationMixin, ProjectMixin, TemplateEntityMixin, TemplateMixin
 from letta.orm.organization import Organization
 from letta.orm.sqlalchemy_base import SqlalchemyBase
 from letta.schemas.agent import AgentState as PydanticAgentState
+
+ENCRYPTED_PLACEHOLDER = "<encrypted>"
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import AgentType
+from letta.schemas.environment_variables import AgentEnvironmentVariable as PydanticAgentEnvVar
 from letta.schemas.letta_stop_reason import StopReasonType
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import Memory
 from letta.schemas.response_format import ResponseFormatUnion
 from letta.schemas.tool_rule import ToolRule
-from letta.utils import calculate_file_defaults_based_on_context_window
+from letta.utils import bounded_gather, calculate_file_defaults_based_on_context_window
 
 if TYPE_CHECKING:
     from letta.orm.agents_tags import AgentsTags
     from letta.orm.archives_agents import ArchivesAgents
+    from letta.orm.conversation import Conversation
     from letta.orm.files_agents import FileAgent
+    from letta.orm.group import Group
     from letta.orm.identity import Identity
+    from letta.orm.llm_batch_items import LLMBatchItem
     from letta.orm.organization import Organization
     from letta.orm.run import Run
+    from letta.orm.sandbox_config import AgentEnvironmentVariable
     from letta.orm.source import Source
     from letta.orm.tool import Tool
 
@@ -41,6 +49,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
         Index("ix_agents_created_at", "created_at", "id"),
         Index("ix_agents_organization_id_deployment_id", "organization_id", "deployment_id"),
         Index("ix_agents_project_id", "project_id"),
+        Index("ix_agents_organization_id_created_by_id", "organization_id", "_created_by_id"),
     )
 
     # agent generates its own id
@@ -72,7 +81,10 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
         LLMConfigColumn, nullable=True, doc="the LLM backend configuration object for this agent."
     )
     embedding_config: Mapped[Optional[EmbeddingConfig]] = mapped_column(
-        EmbeddingConfigColumn, doc="the embedding configuration object for this agent."
+        EmbeddingConfigColumn, nullable=True, doc="the embedding configuration object for this agent."
+    )
+    compaction_settings: Mapped[Optional[dict]] = mapped_column(
+        CompactionSettingsColumn, nullable=True, doc="the compaction settings configuration object for compaction."
     )
 
     # Tool rules
@@ -142,7 +154,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
         "Run",
         back_populates="agent",
         cascade="all, delete-orphan",
-        lazy="selectin",
+        lazy="raise",
         doc="Runs associated with the agent.",
     )
     identities: Mapped[List["Identity"]] = relationship(
@@ -170,6 +182,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
     batch_items: Mapped[List["LLMBatchItem"]] = relationship("LLMBatchItem", back_populates="agent", lazy="raise")
     file_agents: Mapped[List["FileAgent"]] = relationship(
         "FileAgent",
+        primaryjoin="and_(Agent.id == foreign(FileAgent.agent_id), FileAgent.is_deleted == False)",
         back_populates="agent",
         cascade="all, delete-orphan",
         lazy="selectin",
@@ -180,6 +193,13 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
         cascade="all, delete-orphan",
         lazy="noload",
         doc="Archives accessible by this agent.",
+    )
+    conversations: Mapped[List["Conversation"]] = relationship(
+        "Conversation",
+        back_populates="agent",
+        cascade="all, delete-orphan",
+        lazy="raise",
+        doc="Conversations for concurrent messaging on this agent.",
     )
 
     def _get_per_file_view_window_char_limit(self) -> int:
@@ -222,6 +242,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             "metadata": self.metadata_,  # Exposed as 'metadata' to Pydantic
             "llm_config": self.llm_config,
             "embedding_config": self.embedding_config,
+            "compaction_settings": self.compaction_settings,
             "project_id": self.project_id,
             "template_id": self.template_id,
             "base_template_id": self.base_template_id,
@@ -269,6 +290,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
                     is not None
                 ],
                 agent_type=self.agent_type,
+                git_enabled=any(t.tag == "git-memory-enabled" for t in self.tags),
             ),
             "blocks": lambda: [b.to_pydantic() for b in self.core_memory],
             "identity_ids": lambda: [i.id for i in self.identities],
@@ -292,10 +314,33 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
 
         return self.__pydantic_model__(**state)
 
+    async def _get_pending_approval_async(self) -> Optional[Any]:
+        if self.message_ids and len(self.message_ids) > 0:
+            # Try to get the async session this object is attached to
+            session = async_object_session(self)
+            if not session:
+                # Object is detached, can't safely query
+                return None
+
+            latest_message_id = self.message_ids[-1]
+            result = await session.execute(select(MessageModel).where(MessageModel.id == latest_message_id))
+            latest_message = result.scalar_one_or_none()
+
+            if (
+                latest_message
+                and latest_message.role == "approval"
+                and latest_message.tool_calls is not None
+                and len(latest_message.tool_calls) > 0
+            ):
+                pydantic_message = latest_message.to_pydantic()
+                return pydantic_message._convert_approval_request_message()
+        return None
+
     async def to_pydantic_async(
         self,
         include_relationships: Optional[Set[str]] = None,
         include: Optional[List[str]] = None,
+        decrypt: bool = True,
     ) -> PydanticAgentState:
         """
         Converts the SQLAlchemy Agent model into its Pydantic counterpart.
@@ -328,6 +373,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             "metadata": self.metadata_,  # Exposed as 'metadata' to Pydantic
             "llm_config": self.llm_config,
             "embedding_config": self.embedding_config,
+            "compaction_settings": self.compaction_settings,
             "project_id": self.project_id,
             "template_id": self.template_id,
             "base_template_id": self.base_template_id,
@@ -361,6 +407,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             "managed_group": None,
             "tool_exec_environment_variables": [],
             "secrets": [],
+            "pending_approval": None,
         }
 
         # Initialize include_relationships to an empty set if it's None
@@ -376,7 +423,15 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             return None
 
         # Only load requested relationships
-        tags = self.awaitable_attrs.tags if "tags" in include_relationships or "agent.tags" in include_set else empty_list_async()
+        # Always load tags when memory is requested, since git_enabled depends on them
+        tags = (
+            self.awaitable_attrs.tags
+            if "tags" in include_relationships
+            or "memory" in include_relationships
+            or "agent.tags" in include_set
+            or "agent.blocks" in include_set
+            else empty_list_async()
+        )
         tools = self.awaitable_attrs.tools if "tools" in include_relationships or "agent.tools" in include_set else empty_list_async()
         sources = (
             self.awaitable_attrs.sources if "sources" in include_relationships or "agent.sources" in include_set else empty_list_async()
@@ -404,9 +459,20 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
         file_agents = (
             self.awaitable_attrs.file_agents if "memory" in include_relationships or "agent.blocks" in include_set else empty_list_async()
         )
+        pending_approval = self._get_pending_approval_async() if "agent.pending_approval" in include_set else none_async()
 
-        (tags, tools, sources, memory, identities, multi_agent_group, tool_exec_environment_variables, file_agents) = await asyncio.gather(
-            tags, tools, sources, memory, identities, multi_agent_group, tool_exec_environment_variables, file_agents
+        (
+            tags,
+            tools,
+            sources,
+            memory,
+            identities,
+            multi_agent_group,
+            tool_exec_environment_variables,
+            file_agents,
+            pending_approval,
+        ) = await asyncio.gather(
+            tags, tools, sources, memory, identities, multi_agent_group, tool_exec_environment_variables, file_agents, pending_approval
         )
 
         state["tags"] = [t.tag for t in tags]
@@ -420,14 +486,36 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
                 if (block := b.to_pydantic_block(per_file_view_window_char_limit=self._get_per_file_view_window_char_limit())) is not None
             ],
             agent_type=self.agent_type,
+            git_enabled="git-memory-enabled" in state["tags"],
         )
         state["blocks"] = [m.to_pydantic() for m in memory]
         state["identity_ids"] = [i.id for i in identities]
         state["identities"] = [i.to_pydantic() for i in identities]
         state["multi_agent_group"] = multi_agent_group
         state["managed_group"] = multi_agent_group
-        state["tool_exec_environment_variables"] = tool_exec_environment_variables
-        state["secrets"] = tool_exec_environment_variables
+        # Convert ORM env vars to Pydantic, optionally skipping decryption
+        if decrypt:
+            env_vars_pydantic = await bounded_gather([PydanticAgentEnvVar.from_orm_async(e) for e in tool_exec_environment_variables])
+        else:
+            # Skip decryption - return with encrypted values (faster, no PBKDF2)
+            from letta.schemas.environment_variables import AgentEnvironmentVariable
+            from letta.schemas.secret import Secret
+
+            env_vars_pydantic = []
+            for e in tool_exec_environment_variables:
+                data = {
+                    "id": e.id,
+                    "key": e.key,
+                    "description": e.description,
+                    "organization_id": e.organization_id,
+                    "agent_id": e.agent_id,
+                    "value": ENCRYPTED_PLACEHOLDER,
+                    "value_enc": Secret.from_encrypted(e.value_enc) if e.value_enc else None,
+                }
+                env_vars_pydantic.append(AgentEnvironmentVariable.model_validate(data))
+        state["tool_exec_environment_variables"] = env_vars_pydantic
+        state["secrets"] = env_vars_pydantic
+        state["pending_approval"] = pending_approval
         state["model"] = self.llm_config.handle if self.llm_config else None
         state["model_settings"] = self.llm_config._to_model_settings() if self.llm_config else None
         state["embedding"] = self.embedding_config.handle if self.embedding_config else None

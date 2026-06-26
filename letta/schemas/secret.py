@@ -1,4 +1,3 @@
-import json
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -6,6 +5,7 @@ from pydantic_core import core_schema
 
 from letta.helpers.crypto_utils import CryptoUtils
 from letta.log import get_logger
+from letta.utils import bounded_gather
 
 logger = get_logger(__name__)
 
@@ -17,19 +17,17 @@ class Secret(BaseModel):
     This class ensures that sensitive data remains encrypted as much as possible
     while passing through the codebase, only decrypting when absolutely necessary.
 
-    TODO: Once we deprecate plaintext columns in the database:
-    - Remove the dual-write logic in to_dict()
-    - Remove the from_db() method's plaintext_value parameter
-    - Remove the was_encrypted flag (no longer needed for migration)
-    - Simplify get_plaintext() to only handle encrypted values
+    Usage:
+    - Create from plaintext: Secret.from_plaintext(value)
+    - Create from encrypted DB value: Secret.from_encrypted(encrypted_value)
+    - Get encrypted for storage: secret.get_encrypted()
+    - Get plaintext when needed: secret.get_plaintext()
     """
 
     # Store the encrypted value as a regular field
     encrypted_value: Optional[str] = None
     # Cache the decrypted value to avoid repeated decryption (not serialized for security)
     _plaintext_cache: Optional[str] = PrivateAttr(default=None)
-    # Flag to indicate if the value was originally encrypted
-    was_encrypted: bool = False
 
     model_config = ConfigDict(frozen=True)
 
@@ -38,68 +36,116 @@ class Secret(BaseModel):
         """
         Create a Secret from a plaintext value, encrypting it if possible.
 
+        If LETTA_ENCRYPTION_KEY is configured, the value is encrypted.
+        If not, the plaintext value is stored directly in encrypted_value field.
+
         Args:
             value: The plaintext value to encrypt
 
         Returns:
-            A Secret instance with the encrypted value, or plaintext if encryption unavailable
+            A Secret instance with the encrypted (or plaintext) value
         """
         if value is None:
-            return cls.model_construct(encrypted_value=None, was_encrypted=False)
+            return cls.model_construct(encrypted_value=None)
 
         # Guard against double encryption - check if value is already encrypted
         if CryptoUtils.is_encrypted(value):
             logger.warning("Creating Secret from already-encrypted value. This can be dangerous.")
 
-        # Try to encrypt, but fall back to plaintext if no encryption key
+        # Try to encrypt, but fall back to storing plaintext if no encryption key
         try:
             encrypted = CryptoUtils.encrypt(value)
-            return cls.model_construct(encrypted_value=encrypted, was_encrypted=False)
+            return cls.model_construct(encrypted_value=encrypted)
         except ValueError as e:
-            # No encryption key available, store as plaintext
+            # No encryption key available, store as plaintext in the _enc column
             if "No encryption key configured" in str(e):
                 logger.warning(
-                    "No encryption key configured. Storing Secret value as plaintext. "
+                    "No encryption key configured. Storing Secret value as plaintext in _enc column. "
                     "Set LETTA_ENCRYPTION_KEY environment variable to enable encryption."
                 )
-                instance = cls.model_construct(encrypted_value=value, was_encrypted=False)
-                instance._plaintext_cache = value  # Cache it
+                instance = cls.model_construct(encrypted_value=value)
+                instance._plaintext_cache = value  # Cache it since we know the plaintext
                 return instance
             raise  # Re-raise if it's a different error
 
     @classmethod
-    def from_encrypted(cls, encrypted_value: Optional[str]) -> "Secret":
+    async def from_plaintext_async(cls, value: Optional[str]) -> "Secret":
         """
-        Create a Secret from an already encrypted value.
+        Create a Secret from a plaintext value, encrypting it asynchronously.
+
+        This async version runs encryption in a thread pool to avoid blocking
+        the event loop during the CPU-intensive PBKDF2 key derivation (100-500ms).
+
+        Use this method in all async contexts (FastAPI endpoints, async services, etc.)
+        to avoid blocking the event loop.
 
         Args:
-            encrypted_value: The encrypted value
+            value: The plaintext value to encrypt
 
         Returns:
-            A Secret instance
+            A Secret instance with the encrypted (or plaintext) value
         """
-        return cls.model_construct(encrypted_value=encrypted_value, was_encrypted=True)
+        if value is None:
+            return cls.model_construct(encrypted_value=None)
+
+        # Guard against double encryption - check if value is already encrypted
+        if CryptoUtils.is_encrypted(value):
+            logger.warning("Creating Secret from already-encrypted value. This can be dangerous.")
+
+        # Try to encrypt asynchronously, but fall back to storing plaintext if no encryption key
+        try:
+            encrypted = await CryptoUtils.encrypt_async(value)
+            return cls.model_construct(encrypted_value=encrypted)
+        except ValueError as e:
+            # No encryption key available, store as plaintext in the _enc column
+            if "No encryption key configured" in str(e):
+                logger.warning(
+                    "No encryption key configured. Storing Secret value as plaintext in _enc column. "
+                    "Set LETTA_ENCRYPTION_KEY environment variable to enable encryption."
+                )
+                instance = cls.model_construct(encrypted_value=value)
+                instance._plaintext_cache = value  # Cache it since we know the plaintext
+                return instance
+            raise  # Re-raise if it's a different error
 
     @classmethod
-    def from_db(cls, encrypted_value: Optional[str], plaintext_value: Optional[str]) -> "Secret":
+    async def from_plaintexts_async(cls, values: dict[str, str], max_concurrency: int = 10) -> dict[str, "Secret"]:
         """
-        Create a Secret from database values during migration phase.
+        Create multiple Secrets from plaintexts concurrently with bounded concurrency.
 
-        Prefers encrypted value if available, falls back to plaintext.
+        Uses bounded_gather() to encrypt values in parallel while limiting
+        concurrent operations to prevent overwhelming the event loop.
 
         Args:
-            encrypted_value: The encrypted value from the database
-            plaintext_value: The plaintext value from the database
+            values: Dict of key -> plaintext value
+            max_concurrency: Maximum number of concurrent encryption operations (default: 10)
+
+        Returns:
+            Dict of key -> Secret
+        """
+        if not values:
+            return {}
+
+        keys = list(values.keys())
+
+        async def encrypt_one(key: str) -> "Secret":
+            return await cls.from_plaintext_async(values[key])
+
+        secrets = await bounded_gather([encrypt_one(k) for k in keys], max_concurrency=max_concurrency)
+        return dict(zip(keys, secrets))
+
+    @classmethod
+    def from_encrypted(cls, encrypted_value: Optional[str]) -> "Secret":
+        """
+        Create a Secret from an already encrypted value (read from DB).
+
+        Args:
+            encrypted_value: The encrypted value from the _enc column
 
         Returns:
             A Secret instance
         """
-        if encrypted_value is not None:
-            return cls.from_encrypted(encrypted_value)
-        elif plaintext_value is not None:
-            return cls.from_plaintext(plaintext_value)
-        else:
-            return cls.from_plaintext(None)
+        return cls.model_construct(encrypted_value=encrypted_value)
 
     def get_encrypted(self) -> Optional[str]:
         """
@@ -112,28 +158,28 @@ class Secret(BaseModel):
 
     def get_plaintext(self) -> Optional[str]:
         """
-        Get the decrypted plaintext value.
+        Get the decrypted plaintext value (synchronous version).
+
+        WARNING: This performs CPU-intensive PBKDF2 key derivation that can block for 100-500ms.
+        Use get_plaintext_async() in async contexts to avoid blocking the event loop.
 
         This should only be called when the plaintext is actually needed,
         such as when making an external API call.
 
+        If the value is encrypted, it will be decrypted. If the value is stored
+        as plaintext (no encryption key was configured), it will be returned as-is.
+
         Returns:
-            The decrypted plaintext value
+            The decrypted plaintext value, or None if the secret is empty
         """
         if self.encrypted_value is None:
             return None
 
-        # Use cached value if available, but only if it looks like plaintext
-        # or we're confident we can decrypt it
+        # Use cached value if available
         if self._plaintext_cache is not None:
-            # If we have a cache but the stored value looks encrypted and we have no key,
-            # we should not use the cache
-            if CryptoUtils.is_encrypted(self.encrypted_value) and not CryptoUtils.is_encryption_available():
-                self._plaintext_cache = None  # Clear invalid cache
-            else:
-                return self._plaintext_cache
+            return self._plaintext_cache
 
-        # Decrypt and cache
+        # Try to decrypt
         try:
             plaintext = CryptoUtils.decrypt(self.encrypted_value)
             # Cache the decrypted value (PrivateAttr fields can be mutated even with frozen=True)
@@ -142,26 +188,18 @@ class Secret(BaseModel):
         except ValueError as e:
             error_msg = str(e)
 
-            # Handle missing encryption key
+            # Handle missing encryption key - return stored value as plaintext.
+            # When no key is configured, the value was most likely stored as plaintext
+            # (since encryption requires a key). The is_encrypted() heuristic is unreliable
+            # here — it false-positives on long alphanumeric API keys that happen to be
+            # valid base64 with decoded length >= 45 bytes.
             if "No encryption key configured" in error_msg:
-                # Check if the value looks encrypted
-                if CryptoUtils.is_encrypted(self.encrypted_value):
-                    # Value was encrypted, but now we have no key - can't decrypt
-                    logger.warning(
-                        "Cannot decrypt Secret value - no encryption key configured. "
-                        "The value was encrypted and requires the original key to decrypt."
-                    )
-                    # Return None to indicate we can't get the plaintext
-                    return None
-                else:
-                    # Value is plaintext (stored when no key was available)
-                    logger.debug("Secret value is plaintext (stored without encryption)")
-                    self._plaintext_cache = self.encrypted_value
-                    return self.encrypted_value
+                logger.debug("No encryption key configured - returning stored value as plaintext")
+                self._plaintext_cache = self.encrypted_value
+                return self.encrypted_value
 
-            # Handle decryption failure (might be plaintext stored as such)
+            # Handle decryption failure - check if value might be plaintext
             elif "Failed to decrypt data" in error_msg:
-                # Check if it might be plaintext
                 if not CryptoUtils.is_encrypted(self.encrypted_value):
                     # It's plaintext that was stored when no key was available
                     logger.debug("Secret value appears to be plaintext (stored without encryption)")
@@ -171,12 +209,57 @@ class Secret(BaseModel):
                 logger.error("Failed to decrypt Secret value - data may be corrupted or wrong key")
                 raise
 
-            # Migration case: handle legacy plaintext
-            elif not self.was_encrypted:
-                if self.encrypted_value and not CryptoUtils.is_encrypted(self.encrypted_value):
+            # Re-raise for other errors
+            raise
+
+    async def get_plaintext_async(self) -> Optional[str]:
+        """
+        Get the decrypted plaintext value (async version).
+
+        Runs the CPU-intensive PBKDF2 key derivation in a thread pool to avoid
+        blocking the event loop. This prevents the event loop freeze that occurs
+        when decrypting secrets synchronously during HTTP request handling.
+
+        This should be used in all async contexts (FastAPI endpoints, async services, etc.)
+        to avoid blocking the event loop for 100-500ms per decryption.
+
+        Returns:
+            The decrypted plaintext value, or None if the secret is empty
+        """
+        if self.encrypted_value is None:
+            return None
+
+        # Use cached value if available
+        if self._plaintext_cache is not None:
+            return self._plaintext_cache
+
+        # Try to decrypt (async)
+        try:
+            plaintext = await CryptoUtils.decrypt_async(self.encrypted_value)
+            # Cache the decrypted value
+            self._plaintext_cache = plaintext
+            return plaintext
+        except ValueError as e:
+            error_msg = str(e)
+
+            # Handle missing encryption key - return stored value as plaintext.
+            # When no key is configured, the value was most likely stored as plaintext
+            # (since encryption requires a key). The is_encrypted() heuristic is unreliable
+            # here — it false-positives on long alphanumeric API keys that happen to be
+            # valid base64 with decoded length >= 45 bytes.
+            if "No encryption key configured" in error_msg:
+                logger.debug("No encryption key configured - returning stored value as plaintext")
+                self._plaintext_cache = self.encrypted_value
+                return self.encrypted_value
+
+            # Handle decryption failure - check if value might be plaintext
+            elif "Failed to decrypt data" in error_msg:
+                if not CryptoUtils.is_encrypted(self.encrypted_value):
+                    logger.debug("Secret value appears to be plaintext (stored without encryption)")
                     self._plaintext_cache = self.encrypted_value
                     return self.encrypted_value
-                return None
+                logger.error("Failed to decrypt Secret value - data may be corrupted or wrong key")
+                raise
 
             # Re-raise for other errors
             raise
@@ -194,14 +277,6 @@ class Secret(BaseModel):
     def __repr__(self) -> str:
         """Representation that doesn't expose the actual value."""
         return self.__str__()
-
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert to dictionary for database storage.
-
-        Returns both encrypted and plaintext values for dual-write during migration.
-        """
-        return {"encrypted": self.get_encrypted(), "plaintext": self.get_plaintext() if not self.was_encrypted else None}
 
     def __eq__(self, other: Any) -> bool:
         """

@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 
 
 class SystemMessage(BaseModel):
@@ -31,6 +31,10 @@ class AssistantMessage(BaseModel):
     role: str = "assistant"
     name: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
+    reasoning_content: Optional[str] = None
+    reasoning_content_signature: Optional[str] = None
+    redacted_reasoning_content: Optional[str] = None
+    omitted_reasoning_content: Optional[bool] = None
 
 
 class ToolMessage(BaseModel):
@@ -59,7 +63,13 @@ def cast_message_to_subtype(m_dict: dict) -> ChatMessage:
 
 
 class ResponseFormat(BaseModel):
-    type: str = Field(default="text", pattern="^(text|json_object)$")
+    """
+    Response format for OpenAI Chat Completions API.
+    Can be a simple type string or a dict with nested json_schema.
+    """
+
+    # Allow either simple dict or complex nested structure
+    model_config = {"extra": "allow"}  # Allow extra fields for json_schema
 
 
 ## tool_choice ##
@@ -126,17 +136,19 @@ class ChatCompletionRequest(BaseModel):
     max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0
-    response_format: Optional[ResponseFormat] = None
+    response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
     temperature: Optional[float] = 1
     top_p: Optional[float] = 1
     user: Optional[str] = None  # unique ID of the end-user (for monitoring)
+    service_tier: Optional[str] = None
+    prompt_cache_retention: Optional[Literal["in_memory", "24h"]] = None
     parallel_tool_calls: Optional[bool] = None
     instructions: Optional[str] = None
     verbosity: Optional[Literal["low", "medium", "high"]] = None  # For verbosity control in GPT-5 models
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = (
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = (
         None  # For reasoning effort control in reasoning models
     )
 

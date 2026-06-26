@@ -4,7 +4,7 @@ from letta.log import get_logger
 
 logger = get_logger(__name__)
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.embedding_config_overrides import EMBEDDING_HANDLE_OVERRIDES
@@ -25,65 +25,63 @@ class Provider(ProviderBase):
     name: str = Field(..., description="The name of the provider")
     provider_type: ProviderType = Field(..., description="The type of the provider")
     provider_category: ProviderCategory = Field(..., description="The category of the provider (base or byok)")
-    api_key: str | None = Field(None, description="API key or secret key used for requests to the provider.")
+    api_key: str | None = Field(None, description="API key or secret key used for requests to the provider.", deprecated=True)
     base_url: str | None = Field(None, description="Base URL for the provider.")
-    access_key: str | None = Field(None, description="Access key used for requests to the provider.")
+    access_key: str | None = Field(None, description="Access key used for requests to the provider.", deprecated=True)
     region: str | None = Field(None, description="Region used for requests to the provider.")
     api_version: str | None = Field(None, description="API version used for requests to the provider.")
     organization_id: str | None = Field(None, description="The organization id of the user")
     updated_at: datetime | None = Field(None, description="The last update timestamp of the provider.")
+    last_synced: datetime | None = Field(None, description="The last time models were synced for this provider.")
 
     # Encrypted fields (stored as Secret objects, serialized to strings for DB)
     # Secret class handles validation and serialization automatically via __get_pydantic_core_schema__
     api_key_enc: Secret | None = Field(None, description="Encrypted API key as Secret object")
     access_key_enc: Secret | None = Field(None, description="Encrypted access key as Secret object")
 
+    # TODO: remove these checks once fully migrated to encrypted fields
+    def __setattr__(self, name: str, value) -> None:
+        if name in ("api_key", "access_key"):
+            logger.warning(
+                f"DEPRECATION: Setting '{name}' directly is deprecated. Use the encrypted fields (`api_key_enc`/`access_key_enc`) instead."
+            )
+        return super().__setattr__(name, value)
+
+    def __getattribute__(self, name: str):
+        if name in ("api_key", "access_key"):
+            logger.warning(
+                f"DEPRECATION: Accessing '{name}' directly is deprecated. "
+                "Use the encrypted fields (`api_key_enc`/`access_key_enc`) instead."
+            )
+        return super().__getattribute__(name)
+
+    @field_validator("api_key")
+    def deprecate_api_key(cls, v: str):
+        if v:
+            logger.warning(
+                "DEPRECATION: Creating provider with 'api_key' directly is deprecated. Use the encrypted fields (`api_key_enc`) instead."
+            )
+        return v
+
+    @field_validator("access_key")
+    def deprecate_access_key(cls, v: str):
+        if v:
+            logger.warning(
+                "DEPRECATION: Creating provider with 'access_key' directly is deprecated. Use the encrypted fields (`access_key_enc`) instead."
+            )
+        return v
+
     @model_validator(mode="after")
     def default_base_url(self):
         # Set default base URL
         if self.provider_type == ProviderType.openai and self.base_url is None:
             self.base_url = model_settings.openai_api_base
+
         return self
 
     def resolve_identifier(self):
         if not self.id:
             self.id = ProviderBase.generate_id(prefix=ProviderBase.__id_prefix__)
-
-    def get_api_key_secret(self) -> Secret:
-        """Get the API key as a Secret object, preferring encrypted over plaintext."""
-        # If api_key_enc is already a Secret, return it
-        if self.api_key_enc is not None:
-            return self.api_key_enc
-        # Otherwise, create from plaintext api_key
-        return Secret.from_db(None, self.api_key)
-
-    def get_access_key_secret(self) -> Secret:
-        """Get the access key as a Secret object, preferring encrypted over plaintext."""
-        # If access_key_enc is already a Secret, return it
-        if self.access_key_enc is not None:
-            return self.access_key_enc
-        # Otherwise, create from plaintext access_key
-        return Secret.from_db(None, self.access_key)
-
-    def set_api_key_secret(self, secret: Secret) -> None:
-        """Set API key from a Secret object, directly storing the Secret."""
-        self.api_key_enc = secret
-        # Also update plaintext field for dual-write during migration
-        secret_dict = secret.to_dict()
-        if not secret.was_encrypted:
-            self.api_key = secret_dict["plaintext"]
-        else:
-            self.api_key = None
-
-    def set_access_key_secret(self, secret: Secret) -> None:
-        """Set access key from a Secret object, directly storing the Secret."""
-        self.access_key_enc = secret
-        # Also update plaintext field for dual-write during migration
-        secret_dict = secret.to_dict()
-        if not secret.was_encrypted:
-            self.access_key = secret_dict["plaintext"]
-        else:
-            self.access_key = None
 
     async def check_api_key(self):
         """Check if the API key is valid for the provider"""
@@ -92,7 +90,6 @@ class Provider(ProviderBase):
     def list_llm_models(self) -> list[LLMConfig]:
         """List available LLM models (deprecated: use list_llm_models_async)"""
         import asyncio
-        import warnings
 
         logger.warning("list_llm_models is deprecated, use list_llm_models_async instead", stacklevel=2)
 
@@ -117,7 +114,6 @@ class Provider(ProviderBase):
     def list_embedding_models(self) -> list[EmbeddingConfig]:
         """List available embedding models (deprecated: use list_embedding_models_async)"""
         import asyncio
-        import warnings
 
         logger.warning("list_embedding_models is deprecated, use list_embedding_models_async instead", stacklevel=2)
 
@@ -148,6 +144,19 @@ class Provider(ProviderBase):
     async def get_model_context_window_async(self, model_name: str) -> int | None:
         raise NotImplementedError
 
+    def get_default_max_output_tokens(self, model_name: str) -> int:
+        """
+        Get the default max output tokens for a model.
+        Override in subclasses for model-specific logic.
+
+        Args:
+            model_name (str): The name of the model.
+
+        Returns:
+            int: The default max output tokens for the model.
+        """
+        return 4096  # sensible fallback
+
     def get_handle(self, model_name: str, is_embedding: bool = False, base_name: str | None = None) -> str:
         """
         Get the handle for a model, with support for custom overrides.
@@ -172,20 +181,27 @@ class Provider(ProviderBase):
         from letta.schemas.providers import (
             AnthropicProvider,
             AzureProvider,
+            BasetenProvider,
             BedrockProvider,
             CerebrasProvider,
+            ChatGPTOAuthProvider,
             DeepSeekProvider,
             GoogleAIProvider,
             GoogleVertexProvider,
             GroqProvider,
             LettaProvider,
             LMStudioOpenAIProvider,
+            MiniMaxProvider,
             MistralProvider,
             OllamaProvider,
             OpenAIProvider,
+            OpenRouterProvider,
+            SGLangProvider,
             TogetherProvider,
             VLLMProvider,
             XAIProvider,
+            ZAICodingProvider,
+            ZAIProvider,
         )
 
         if self.base_url == "":
@@ -212,18 +228,32 @@ class Provider(ProviderBase):
                 return OllamaProvider(**self.model_dump(exclude_none=True))
             case ProviderType.vllm:
                 return VLLMProvider(**self.model_dump(exclude_none=True))  # Removed support for CompletionsProvider
+            case ProviderType.sglang:
+                return SGLangProvider(**self.model_dump(exclude_none=True))
             case ProviderType.mistral:
                 return MistralProvider(**self.model_dump(exclude_none=True))
             case ProviderType.deepseek:
                 return DeepSeekProvider(**self.model_dump(exclude_none=True))
             case ProviderType.cerebras:
                 return CerebrasProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.chatgpt_oauth:
+                return ChatGPTOAuthProvider(**self.model_dump(exclude_none=True))
             case ProviderType.xai:
                 return XAIProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.zai:
+                return ZAIProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.zai_coding:
+                return ZAICodingProvider(**self.model_dump(exclude_none=True))
             case ProviderType.lmstudio_openai:
                 return LMStudioOpenAIProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.baseten:
+                return BasetenProvider(**self.model_dump(exclude_none=True))
             case ProviderType.bedrock:
                 return BedrockProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.minimax:
+                return MiniMaxProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.openrouter:
+                return OpenRouterProvider(**self.model_dump(exclude_none=True))
             case _:
                 raise ValueError(f"Unknown provider type: {self.provider_type}")
 
@@ -237,6 +267,11 @@ class ProviderCreate(ProviderBase):
     base_url: str | None = Field(None, description="Base URL used for requests to the provider.")
     api_version: str | None = Field(None, description="API version used for requests to the provider.")
 
+    @field_validator("api_key", "access_key", mode="before")
+    @classmethod
+    def strip_whitespace(cls, v: str | None) -> str | None:
+        return v.strip() if isinstance(v, str) else v
+
 
 class ProviderUpdate(ProviderBase):
     api_key: str = Field(..., description="API key or secret key used for requests to the provider.")
@@ -244,6 +279,11 @@ class ProviderUpdate(ProviderBase):
     region: str | None = Field(None, description="Region used for requests to the provider.")
     base_url: str | None = Field(None, description="Base URL used for requests to the provider.")
     api_version: str | None = Field(None, description="API version used for requests to the provider.")
+
+    @field_validator("api_key", "access_key", mode="before")
+    @classmethod
+    def strip_whitespace(cls, v: str | None) -> str | None:
+        return v.strip() if isinstance(v, str) else v
 
 
 class ProviderCheck(BaseModel):
@@ -253,3 +293,8 @@ class ProviderCheck(BaseModel):
     region: str | None = Field(None, description="Region used for requests to the provider.")
     base_url: str | None = Field(None, description="Base URL used for requests to the provider.")
     api_version: str | None = Field(None, description="API version used for requests to the provider.")
+
+    @field_validator("api_key", "access_key", mode="before")
+    @classmethod
+    def strip_whitespace(cls, v: str | None) -> str | None:
+        return v.strip() if isinstance(v, str) else v

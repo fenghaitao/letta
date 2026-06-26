@@ -43,7 +43,8 @@ async def _clear_tables():
             if table.name == "block_history":
                 continue
             await session.execute(table.delete())  # Truncate table
-        await session.commit()
+        # context manager now handles commits
+        # await session.commit()
 
 
 def _run_server():
@@ -140,19 +141,19 @@ async def create_test_agent(name, actor, test_id: Optional[str] = None, model="a
         model="claude-3-7-sonnet-latest",
         model_endpoint_type="anthropic",
         model_endpoint="https://api.anthropic.com/v1",
-        context_window=32000,
+        context_window=128000,
         handle="anthropic/claude-3-7-sonnet-latest",
         put_inner_thoughts_in_kwargs=True,
         max_tokens=4096,
     )
 
     dummy_embedding_config = EmbeddingConfig(
-        embedding_model="letta-free",
+        embedding_model="text-embedding-3-small",
         embedding_endpoint_type="openai",
-        embedding_endpoint="https://embeddings.letta.com/",
+        embedding_endpoint="https://api.openai.com/v1",
         embedding_dim=1536,
         embedding_chunk_size=300,
-        handle="letta/letta-free",
+        handle="openai/text-embedding-3-small",
     )
 
     agent_manager = AgentManager()
@@ -192,7 +193,7 @@ async def create_test_batch_item(server, batch_id, agent_id, default_user):
         model="claude-3-7-sonnet-latest",
         model_endpoint_type="anthropic",
         model_endpoint="https://api.anthropic.com/v1",
-        context_window=32000,
+        context_window=128000,
         handle="anthropic/claude-3-7-sonnet-latest",
         put_inner_thoughts_in_kwargs=True,
         max_tokens=4096,

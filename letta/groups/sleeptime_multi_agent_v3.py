@@ -9,11 +9,13 @@ from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState
 from letta.schemas.enums import RunStatus
 from letta.schemas.group import Group, ManagerType
-from letta.schemas.job import JobUpdate
 from letta.schemas.letta_message import MessageType
 from letta.schemas.letta_message_content import TextContent
+from letta.schemas.letta_request import ClientToolSchema
 from letta.schemas.letta_response import LettaResponse
+from letta.schemas.letta_stop_reason import StopReasonType
 from letta.schemas.message import Message, MessageCreate
+from letta.schemas.provider_trace import BillingContext
 from letta.schemas.run import Run, RunUpdate
 from letta.schemas.user import User
 from letta.services.group_manager import GroupManager
@@ -34,6 +36,7 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
 
         # Additional manager classes
         self.group_manager = GroupManager()
+        self._billing_context: BillingContext | None = None
 
     @trace_method
     async def step(
@@ -44,8 +47,14 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
         use_assistant_message: bool = False,
         include_return_message_types: list[MessageType] | None = None,
         request_start_timestamp_ns: int | None = None,
+        client_tools: list[ClientToolSchema] | None = None,
+        client_skills=None,
+        override_system: str | None = None,
+        include_compaction_messages: bool = False,
+        billing_context: "BillingContext | None" = None,
     ) -> LettaResponse:
         self.run_ids = []
+        self._billing_context = billing_context
 
         for i in range(len(input_messages)):
             input_messages[i].group_id = self.group.id
@@ -57,9 +66,14 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
             use_assistant_message=use_assistant_message,
             include_return_message_types=include_return_message_types,
             request_start_timestamp_ns=request_start_timestamp_ns,
+            client_tools=client_tools,
+            client_skills=client_skills,
+            override_system=override_system,
+            include_compaction_messages=include_compaction_messages,
+            billing_context=billing_context,
         )
 
-        await self.run_sleeptime_agents()
+        await self.run_sleeptime_agents(billing_context=billing_context)
 
         response.usage.run_ids = self.run_ids
         return response
@@ -74,8 +88,15 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
         use_assistant_message: bool = True,
         request_start_timestamp_ns: int | None = None,
         include_return_message_types: list[MessageType] | None = None,
+        client_tools: list[ClientToolSchema] | None = None,
+        client_skills=None,
+        override_system: str | None = None,
+        include_compaction_messages: bool = False,
+        billing_context: "BillingContext | None" = None,
+        openai_responses_websocket: bool = False,
     ) -> AsyncGenerator[str, None]:
         self.run_ids = []
+        self._billing_context = billing_context
 
         for i in range(len(input_messages)):
             input_messages[i].group_id = self.group.id
@@ -90,17 +111,24 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
                 use_assistant_message=use_assistant_message,
                 include_return_message_types=include_return_message_types,
                 request_start_timestamp_ns=request_start_timestamp_ns,
+                client_tools=client_tools,
+                client_skills=client_skills,
+                override_system=override_system,
+                include_compaction_messages=include_compaction_messages,
+                billing_context=billing_context,
             ):
                 yield chunk
         finally:
             # For some reason, stream is throwing a GeneratorExit even though it appears the that client
             # is getting the whole stream. This pattern should work to ensure sleeptime agents run despite this.
-            await self.run_sleeptime_agents()
+            await self.run_sleeptime_agents(billing_context=billing_context)
 
     @trace_method
-    async def run_sleeptime_agents(self):
+    async def run_sleeptime_agents(self, billing_context: BillingContext | None = None):
         # Get response messages
         last_response_messages = self.response_messages
+
+        billing_context = billing_context or self._billing_context
 
         # Update turns counter
         turns_counter = None
@@ -120,6 +148,7 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
                         sleeptime_agent_id,
                         last_response_messages,
                         last_processed_message_id,
+                        billing_context,
                     )
                     self.run_ids.append(sleeptime_run_id)
                 except Exception as e:
@@ -133,6 +162,7 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
         sleeptime_agent_id: str,
         response_messages: list[Message],
         last_processed_message_id: str,
+        billing_context: BillingContext | None,
     ) -> str:
         run = Run(
             agent_id=sleeptime_agent_id,
@@ -151,6 +181,7 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
                 response_messages=response_messages,
                 last_processed_message_id=last_processed_message_id,
                 run_id=run.id,
+                billing_context=billing_context,
             ),
             label=f"participant_agent_step_{sleeptime_agent_id}",
         )
@@ -164,6 +195,7 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
         response_messages: list[Message],
         last_processed_message_id: str,
         run_id: str,
+        billing_context: BillingContext | None,
     ) -> LettaResponse:
         try:
             # Update run status
@@ -208,12 +240,14 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
             result = await sleeptime_agent.step(
                 input_messages=sleeptime_agent_messages,
                 run_id=run_id,
+                billing_context=billing_context,
             )
 
             # Update run status
             run_update = RunUpdate(
                 status=RunStatus.completed,
                 completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                stop_reason=result.stop_reason.stop_reason if result.stop_reason else StopReasonType.end_turn,
                 metadata={
                     "result": result.model_dump(mode="json"),
                     "agent_id": sleeptime_agent_state.id,
@@ -225,6 +259,7 @@ class SleeptimeMultiAgentV3(LettaAgentV2):
             run_update = RunUpdate(
                 status=RunStatus.failed,
                 completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                stop_reason=StopReasonType.error,
                 metadata={"error": str(e)},
             )
             await self.run_manager.update_run_by_id_async(run_id=run_id, update=run_update, actor=self.actor)

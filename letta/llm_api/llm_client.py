@@ -79,6 +79,13 @@ class LLMClient:
                     put_inner_thoughts_first=put_inner_thoughts_first,
                     actor=actor,
                 )
+            case ProviderType.zai | ProviderType.zai_coding:
+                from letta.llm_api.zai_client import ZAIClient
+
+                return ZAIClient(
+                    put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=actor,
+                )
             case ProviderType.groq:
                 from letta.llm_api.groq_client import GroqClient
 
@@ -86,10 +93,46 @@ class LLMClient:
                     put_inner_thoughts_first=put_inner_thoughts_first,
                     actor=actor,
                 )
+            case ProviderType.minimax:
+                from letta.llm_api.minimax_client import MiniMaxClient
+
+                return MiniMaxClient(
+                    put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=actor,
+                )
+            case ProviderType.openrouter:
+                # OpenRouter uses OpenAI-compatible API, so we can use the OpenAI client directly
+                from letta.llm_api.openai_client import OpenAIClient
+
+                return OpenAIClient(
+                    put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=actor,
+                )
             case ProviderType.deepseek:
                 from letta.llm_api.deepseek_client import DeepseekClient
 
                 return DeepseekClient(
+                    put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=actor,
+                )
+            case ProviderType.baseten:
+                from letta.llm_api.baseten_client import BasetenClient
+
+                return BasetenClient(
+                    put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=actor,
+                )
+            case ProviderType.fireworks:
+                from letta.llm_api.fireworks_client import FireworksClient
+
+                return FireworksClient(
+                    put_inner_thoughts_first=put_inner_thoughts_first,
+                    actor=actor,
+                )
+            case ProviderType.chatgpt_oauth:
+                from letta.llm_api.chatgpt_oauth_client import ChatGPTOAuthClient
+
+                return ChatGPTOAuthClient(
                     put_inner_thoughts_first=put_inner_thoughts_first,
                     actor=actor,
                 )
